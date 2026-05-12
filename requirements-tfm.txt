@@ -1,0 +1,7 @@
+torch==2.11.0
+torchvision==0.26.0
+torchmetrics==1.9.0
+optimum-quanto==0.2.7
+fxpmath==0.4.10
+gurobipy==13.0.1
+numpy==2.4.4
