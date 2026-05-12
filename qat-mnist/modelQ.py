@@ -579,9 +579,11 @@ if __name__ == "__main__":
         identity_pool1 = make_qscales_from_float(np.ones(pool1_w_eq.shape[0], dtype=np.float64))
 
         # Conv linealizada + pool lineal + clasificador (sin ReLU en salida: logits).
+        # nn2logic exige relu=True en todas las capas salvo la ultima (SequentialCreator.hpp).
+        # Tras conv+ReLU las entradas al pool son >= 0; ReLU post-pool coincide con la red real.
         qlayers = [
             QLayer(conv1_w_int, conv1_b_shifted.astype(np.int64), True, make_qscales_from_float(r1_scales_exp)),
-            QLayer(pool1_w_eq, pool1_b_eq, False, identity_pool1),
+            QLayer(pool1_w_eq, pool1_b_eq, True, identity_pool1),
             QLayer(*lin1.export(), False, r3.expQScales()),
         ]
         log_tree_build(
