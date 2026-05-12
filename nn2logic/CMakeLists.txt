@@ -46,7 +46,7 @@ target_link_libraries(nn2logic PRIVATE fmt::fmt)
 #add_compile_definitions(FMT_HEADER_ONLY)
 
 # Eigen
-find_package(Eigen3 3.4...5.0.1 REQUIRED NO_MODULE)
+find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 target_link_libraries(nn2logic PRIVATE Eigen3::Eigen)
 
 # Json
