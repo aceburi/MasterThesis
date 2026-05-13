@@ -835,7 +835,7 @@ if __name__ == "__main__":
             t1 = time.perf_counter()
             out.setDataset(ctx["samples"])
             print(f"[tree] setDataset fin en {time.perf_counter() - t1:.1f}s", flush=True)
-            out_path = Path("qat-mnist-tree.json")
+            out_path = Path(os.environ.get("QAT_MNIST_TREE_JSON", "qat-mnist-tree.json"))
             print(f"[tree] save() inicio -> {out_path} (serializacion JSON, sin barra de progreso)...", flush=True)
             t2 = time.perf_counter()
             out.save(str(out_path))
