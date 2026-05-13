@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import sys
 import time
@@ -43,7 +44,15 @@ if os.name == "nt" and hasattr(os, "add_dll_directory"):
 NN2LOGIC_AVAILABLE = False
 NN2LOGIC_IMPORT_ERROR = None
 try:
-    from nn2logic import FixedPoint, InputEncoder, QLayer, QScales, QTreeBuilder, StorageAdaptor  # type: ignore[reportMissingImports]
+    from nn2logic import (  # type: ignore[reportMissingImports]
+        FixedPoint,
+        InputEncoder,
+        QLayer,
+        QScales,
+        QTreeAnalyze,
+        QTreeBuilder,
+        StorageAdaptor,
+    )
     NN2LOGIC_AVAILABLE = True
 except ImportError:
     # Ruta local del paquete incluido en este mismo repo (sin depender de Repo_1).
@@ -53,7 +62,15 @@ except ImportError:
     if VENDORED_NN2LOGIC_ROOT not in sys.path:
         sys.path.insert(0, VENDORED_NN2LOGIC_ROOT)
     try:
-        from nn2logic import FixedPoint, InputEncoder, QLayer, QScales, QTreeBuilder, StorageAdaptor  # type: ignore[reportMissingImports]
+        from nn2logic import (  # type: ignore[reportMissingImports]
+            FixedPoint,
+            InputEncoder,
+            QLayer,
+            QScales,
+            QTreeAnalyze,
+            QTreeBuilder,
+            StorageAdaptor,
+        )
         NN2LOGIC_AVAILABLE = True
     except ImportError as exc:
         NN2LOGIC_IMPORT_ERROR = exc
@@ -373,30 +390,235 @@ def extract_int_input_sample(x, scaler):
     return [int(a) for a in xin.tolist()]
 
 
-if __name__ == "__main__":
-    skip_tree_build = os.environ.get("SKIP_TREE_BUILD", "0") == "1"
-    if not NN2LOGIC_AVAILABLE:
-        warnings.warn(
-            "nn2logic no esta disponible en este entorno. "
-            "Se ejecutara entrenamiento/cuantizacion, pero se omitira la exportacion del arbol. "
-            f"Detalle import: {NN2LOGIC_IMPORT_ERROR}"
+def _fp_to_double(fp_obj):
+    """Convierte FixedPoint de nn2logic o dict JSON {value, shift} a float."""
+    if isinstance(fp_obj, dict):
+        return float(fp_obj["value"]) / float(1 << int(fp_obj["shift"]))
+    val = int(fp_obj.value)
+    shift = int(fp_obj.shift)
+    return float(val) / float(1 << shift)
+
+
+def qlayer_forward_process_samples(layer_json, x_vec):
+    """
+    Replica la propagacion entre nodos de SequentialCreator::processSamplesLayer:
+    z = W*x + b; z *= escala; clamp [0,127] si relu.
+    """
+    w = np.asarray(layer_json["weight"], dtype=np.float64)
+    b = np.asarray(layer_json["bias"], dtype=np.float64).reshape(-1)
+    x = np.asarray(x_vec, dtype=np.float64).reshape(-1)
+    scales = [_fp_to_double(s) for s in layer_json["requant"]["scales"]]
+    z = w @ x + b
+    z = z * np.asarray(scales, dtype=np.float64)
+    if layer_json.get("relu", False):
+        z = np.minimum(np.maximum(z, 0.0), 127.0)
+    return z
+
+
+def logits_from_qlayers_json(layers_json, x0_shifted_float):
+    """Forward completo por la lista de capas del JSON (misma cadena que el arbol)."""
+    x = np.asarray(x0_shifted_float, dtype=np.float64).reshape(-1)
+    for li in range(len(layers_json)):
+        layer = layers_json[li]
+        z = qlayer_forward_process_samples(layer, x)
+        if li == len(layers_json) - 1:
+            return z
+        x = z
+
+
+def relu_decision_raw(layer_json, neuron_idx, x_vec):
+    """Igual que SEvaluator::decide: (fila W)*x + b > 0 SIN escala de requant."""
+    w = np.asarray(layer_json["weight"], dtype=np.float64)
+    b = np.asarray(layer_json["bias"], dtype=np.float64).reshape(-1)
+    x = np.asarray(x_vec, dtype=np.float64).reshape(-1)
+    raw = float(w[neuron_idx] @ x + b[neuron_idx])
+    return raw > 0.0, raw
+
+
+def leaf_predict_class(leaf_json):
+    poss = leaf_json.get("possClasses", [])
+    if sum(1 for p in poss if p) == 1:
+        return int(next(i for i, p in enumerate(poss) if p))
+    return None
+
+
+def path_matches_sample(path_json, layers_json, x_input_shifted):
+    """
+    Comprueba si la entrada (784 floats, ya pixel-shifted como en nn2logic)
+    satisface todas las Decision del path.
+    """
+    x = np.asarray(x_input_shifted, dtype=np.float64).reshape(-1)
+    for li in range(len(layers_json)):
+        layer = layers_json[li]
+        for dec in path_json["decisions"]:
+            if dec["layerIdx"] != li:
+                continue
+            ok, _ = relu_decision_raw(layer, int(dec["neuronIdx"]), x)
+            if ok != bool(dec["decision"]):
+                return False
+
+        if li < len(layers_json) - 1:
+            x = qlayer_forward_process_samples(layer, x)
+    return True
+
+
+def run_tree_metrics_qat(
+    tree_json_path,
+    test_dataset,
+    mod,
+    device,
+    pixel_shift,
+    *,
+    eval_limit,
+    fast_metrics_only,
+    analyze_filename="tree_analyze_qat_mnist.json",
+):
+    """Metricas sobre un qat-mnist-tree.json (misma logica que modelQ_lowram.run_tree_metrics_lowram)."""
+    if not os.path.isfile(tree_json_path):
+        print(f"[tree-metrics] omitido: no existe {tree_json_path}", flush=True)
+        return
+
+    t0 = time.perf_counter()
+    print("=" * 72, flush=True)
+    print("[tree-metrics] INICIO (modelQ / qat-mnist-tree.json)", flush=True)
+    print(f"  arbol: {tree_json_path}", flush=True)
+    print(f"  TREE_EVAL_LIMIT={eval_limit}  TREE_FAST_METRICS={int(fast_metrics_only)}", flush=True)
+
+    stats = QTreeAnalyze(StorageAdaptor(os.path.abspath(tree_json_path)))
+    with open(analyze_filename, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2, default=str)
+    print(f"[tree-metrics] QTreeAnalyze guardado en: {analyze_filename}", flush=True)
+    print("[tree-metrics] --- QTreeAnalyze (salida completa, consola) ---", flush=True)
+    try:
+        print(json.dumps(stats, indent=2, ensure_ascii=False, default=str), flush=True)
+    except (TypeError, ValueError):
+        print(str(stats), flush=True)
+    print("[tree-metrics] --- fin QTreeAnalyze ---", flush=True)
+
+    if fast_metrics_only:
+        print(
+            f"[tree-metrics] modo rapido (sin path matching), tiempo={time.perf_counter() - t0:.2f}s",
+            flush=True,
         )
-    # Seleccion de dispositivo.
+        print("=" * 72, flush=True)
+        return
+
+    with open(tree_json_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    layers_json = doc["layers"]
+    paths_json = doc["paths"]
+    print(f"[tree-metrics] paths={len(paths_json)} layers={len(layers_json)}", flush=True)
+
+    metric_chain = BinaryAccuracy().to(device)
+    counts = {
+        "chain_eval": 0,
+        "path_match": 0,
+        "path_multi": 0,
+        "path_none": 0,
+        "leaf_ambiguous": 0,
+        "leaf_correct": 0,
+        "leaf_wrong": 0,
+    }
+
+    max_paths_warn = int(os.environ.get("TREE_PATH_WARN", "4000"))
+    if len(paths_json) > max_paths_warn:
+        print(
+            f"[tree-metrics] aviso: {len(paths_json)} paths; matching puede ser lento. "
+            f"Usa TREE_FAST_METRICS=1 o reduce TREE_EVAL_LIMIT.",
+            flush=True,
+        )
+
+    progress_step = max(1, int(os.environ.get("TREE_METRICS_PROGRESS", "50")))
+    print(
+        f"[tree-metrics] evaluando {eval_limit} muestras de test (progreso cada {progress_step})...",
+        flush=True,
+    )
+
+    for idx, (x_img, y) in enumerate(islice(test_dataset, eval_limit)):
+        if idx > 0 and idx % progress_step == 0:
+            print(f"[tree-metrics] ... muestra {idx}/{eval_limit}", flush=True)
+        xs = extract_int_input_sample(x_img.to(device), mod)
+        x_shift = np.array([float(v) + pixel_shift for v in xs], dtype=np.float64)
+
+        logits = logits_from_qlayers_json(layers_json, x_shift)
+        pred_chain = int(np.argmax(logits))
+        metric_chain.update(torch.tensor([pred_chain], device=device), torch.tensor([int(y)], device=device))
+        counts["chain_eval"] += 1
+
+        matched = [p for p in paths_json if path_matches_sample(p, layers_json, x_shift)]
+        if len(matched) == 0:
+            counts["path_none"] += 1
+            continue
+        if len(matched) > 1:
+            counts["path_multi"] += 1
+            matched.sort(key=lambda p: int(p.get("visitFreq", 0)), reverse=True)
+
+        leaf_cls = leaf_predict_class(matched[0]["leaf"])
+        counts["path_match"] += 1
+        if leaf_cls is None:
+            counts["leaf_ambiguous"] += 1
+            continue
+        if leaf_cls == int(y):
+            counts["leaf_correct"] += 1
+        else:
+            counts["leaf_wrong"] += 1
+
+    chain_acc = metric_chain.compute().item()
+    det = counts["leaf_correct"] + counts["leaf_wrong"]
+    print("", flush=True)
+    print("[tree-metrics] --- RESUMEN (consola) ---", flush=True)
+    print(f"  qlayer_chain accuracy (n={counts['chain_eval']}): {chain_acc:.4f}", flush=True)
+    print(
+        "  paths: "
+        f"con_match={counts['path_match']} sin_match={counts['path_none']} "
+        f"multi_match={counts['path_multi']} hoja_ambigua={counts['leaf_ambiguous']}",
+        flush=True,
+    )
+    print(
+        f"  aciertos_hoja={counts['leaf_correct']} fallos_hoja={counts['leaf_wrong']}",
+        flush=True,
+    )
+    if det > 0:
+        print(
+            f"  path leaf accuracy (solo hojas deterministas, n={det}): "
+            f"{counts['leaf_correct'] / det:.4f}",
+            flush=True,
+        )
+    else:
+        print(
+            "  path leaf accuracy: N/A (ninguna hoja determinista en las muestras evaluadas)",
+            flush=True,
+        )
+    print(f"  tiempo total metricas: {time.perf_counter() - t0:.2f}s", flush=True)
+    print("[tree-metrics] FIN", flush=True)
+    print("=" * 72, flush=True)
+
+
+def qat_mnist_prepare_until_qlayers(
+    dataset_root="./dataset",
+    ckpt_path="mnist_cnn_tiny.ckpt",
+    tree_sample_limit=None,
+    *,
+    build_qlayers=True,
+):
+    """
+    Replica el arranque de __main__ hasta tener qlayers/samples/encoder (si build_qlayers).
+    Las muestras del arbol se toman de full_train (igual que __main__), no del split train_set.
+    """
+    if build_qlayers and not NN2LOGIC_AVAILABLE:
+        raise RuntimeError(f"nn2logic requerido para QLayer. Detalle: {NN2LOGIC_IMPORT_ERROR}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Preprocesado MNIST: tensor + normalizacion clasica.
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
     )
 
-    # Carga de dataset.
-    full_train = datasets.MNIST(root="./dataset", train=True, download=True, transform=transform)
-    full_test = datasets.MNIST(root="./dataset", train=False, download=True, transform=transform)
-    # Conversion a binario: 0=par, 1=impar.
+    full_train = datasets.MNIST(root=dataset_root, train=True, download=True, transform=transform)
+    full_test = datasets.MNIST(root=dataset_root, train=False, download=True, transform=transform)
     full_train.targets = full_train.targets % 2
     full_test.targets = full_test.targets % 2
 
-    # Split train/val reproducible (se usa la parte train como dataset de trabajo).
     train_set, _ = random_split(full_train, [0.8, 0.2], torch.Generator().manual_seed(42))
     test_set = full_test
 
@@ -404,8 +626,6 @@ if __name__ == "__main__":
     calib_loader = DataLoader(full_train, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_set, batch_size=512, shuffle=False)
 
-    # Carga de checkpoint si existe; si no, entrenamiento inicial y guardado.
-    ckpt_path = "mnist_cnn_tiny.ckpt"
     model = CNN().to(device)
     lossF = nn.CrossEntropyLoss()
 
@@ -417,59 +637,45 @@ if __name__ == "__main__":
             trainModel(model, optimizer, lossF, train_loader, device)
         torch.save(model.state_dict(), ckpt_path)
 
-    # Cuantizacion fake-quant con optimum.quanto.
     quantize(model, weights=qint8, activations=qint8)
-    # Calibracion de activaciones recorriendo datos de entrenamiento.
     with Calibration():
         modelCompute(model, calib_loader, device)
 
-    # Reentrenamiento (QAT) con modelo ya cuantizado.
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     for _ in range(3):
         trainModel(model, optimizer, lossF, train_loader, device)
     testModel(model, test_loader, device)
 
-    # Congela parametros cuantizados para exportar estado final.
     model.eval()
     freeze(model)
     state_dict = model.state_dict()
 
-    # Rango maximo int8 simetrico.
     amm_max = 127.0
-    # Escala de entrada capturada por quanto para primera capa.
     input_scale = float(state_dict["conv1.input_scale"].item())
     layers = []
 
-    # Escalado inicial de entrada: pasa de float normalizado a dominio entero.
     mod = DumbScaler(1.0 / input_scale, trackMax=True)
     modelCompute(mod, calib_loader)
     layers.append(mod)
 
-    # -------- Capa Conv1 reconstruida --------
     p1 = layerBaseParams(state_dict, "conv1")
     conv1 = DumbConv(
         p1["weight"],
-        # Bias reescalado al dominio entero de la capa.
         np.round(p1["bias"] / (input_scale * p1["weight_scale"])),
     )
     layers.append(conv1)
     layers.append(nn.ReLU())
     layers.append(nn.MaxPool2d(2, 2))
 
-    # Requant provisional para medir maximo y ajustar escala final.
     r1i = DumbScaler(input_scale * p1["weight_scale"], trackMax=True)
     layers.append(r1i)
     modelCompute(nn.Sequential(*layers), calib_loader)
-    # Requant final con "magic number" adaptado al max observado.
     r1 = DumbScaler((amm_max * input_scale * p1["weight_scale"]) / max(r1i.max, 1.0))
     layers[-1] = r1
-    # Actualizamos escala global para la siguiente capa.
     input_scale = (amm_max * input_scale) / max(r1i.max, 1.0)
 
-    # A partir de aqui pasamos a vector 1D para la capa lineal de salida.
     layers.append(nn.Flatten())
 
-    # -------- Capa Lin1 (clasificador 2 clases) reconstruida --------
     p3 = layerBaseParams(state_dict, "lin1")
     lin1 = DumbLinear(
         p3["weight"],
@@ -483,119 +689,142 @@ if __name__ == "__main__":
     r3 = DumbScaler((amm_max * input_scale * p3["weight_scale"]) / max(r3i.max, 1.0))
     layers[-1] = r3
 
-    # Red "dumb" completa para comprobar que mantiene buen rendimiento.
     dumb = nn.Sequential(*layers).to(device)
     testModel(dumb, test_loader, device)
 
-    # Frontend usado para diagnostico/comparacion.
     frontend = nn.Sequential(mod, conv1, nn.ReLU(), nn.MaxPool2d(2, 2), r1)
     frontend = frontend.to(device)
 
-    # -------- Linealizacion real de conv (im2col/unfold) --------
-    # Conv1: entrada 1x28x28 -> salida 2x28x28
     conv1_w_eq, _, conv1_out_shape = conv2d_to_linear(
         p1["weight"], p1["bias"], (1, 28, 28), stride=model.conv1.stride, padding=model.conv1.padding, print_shapes=True
     )
-    conv1_b_ch = np.round(p1["bias"] / (float(state_dict["conv1.input_scale"].item()) * p1["weight_scale"])).astype(np.int64)
+    conv1_b_ch = np.round(p1["bias"] / (float(state_dict["conv1.input_scale"].item()) * p1["weight_scale"])).astype(
+        np.int64
+    )
     conv1_b_eq = np.repeat(conv1_b_ch, conv1_out_shape[1] * conv1_out_shape[2])
 
-    # Downsample lineal para mantener encadenado dimensional (aprox. lineal del maxpool).
     pool1_w_eq, pool1_b_eq, pool1_out_shape = build_pool2d_selector_linear(
         conv1_out_shape[0], conv1_out_shape[1], conv1_out_shape[2], kernel=2, stride=2
     )
 
-    # Logs minimos utiles de shape para depuracion.
     print(f"[linearize] conv1_eq={conv1_w_eq.shape}, pool1_eq={pool1_w_eq.shape}, pool1_out={pool1_out_shape}")
 
     assert pool1_out_shape == (2, 14, 14), "La salida linealizada debe encajar con lin1 (2x14x14)."
 
+    out = {
+        "device": device,
+        "test_set": test_set,
+        "full_train": full_train,
+        "mod": mod,
+        "conv1": conv1,
+        "dumb": dumb,
+        "frontend": frontend,
+        "lin1": lin1,
+        "r1": r1,
+        "r3": r3,
+        "model": model,
+    }
+
+    if not build_qlayers:
+        return out
+
+    runtime_check = gurobi_runtime_check()
+    log_tree_build(f"[solver] runtime_check={runtime_check}")
+    if not runtime_check["ok"]:
+        raise RuntimeError(
+            "Fallo precheck de solver (Gurobi). "
+            "Posibles causas: paquete gurobipy no instalado, licencia no activa, o variables de entorno incompletas. "
+            f"Detalle: {runtime_check['error']}. "
+            "Revisa GRB_LICENSE_FILE/GUROBI_HOME y que la licencia sea valida para esta maquina."
+        )
+
+    train_count = len(full_train)
+    if tree_sample_limit is None:
+        limit_raw = os.environ.get("NN2LOGIC_SAMPLE_LIMIT")
+        ts_limit = train_count if limit_raw is None else int(limit_raw)
+    else:
+        ts_limit = int(tree_sample_limit)
+        limit_raw = str(ts_limit)
+    if ts_limit <= 0:
+        raise RuntimeError("NN2LOGIC_SAMPLE_LIMIT debe ser > 0.")
+    ts_limit = min(ts_limit, train_count)
+    log_tree_build(
+        f"[tree] sample_limit={ts_limit} train_count={train_count} "
+        f"(env={limit_raw if tree_sample_limit is None else f'arg={tree_sample_limit}'})"
+    )
+
+    samples = []
+    for x, y in islice(full_train, ts_limit):
+        xs = extract_int_input_sample(x.to(device), mod)
+        samples.append((xs, int(y)))
+    validate_samples(samples, 28 * 28)
+
+    flat_vals = [v for xs, _ in samples for v in xs]
+    pixel_shift = int(max(0, -min(flat_vals)))
+    max_shifted = int(max(v + pixel_shift for v in flat_vals))
+    input_upper = max(255, max_shifted)
+    samples = [([int(v) + pixel_shift for v in xs], y) for xs, y in samples]
+    validate_samples(samples, 28 * 28)
+
+    encoder = InputEncoder()
+    for idx in range(28 * 28):
+        encoder.registerInt(f"x_{idx}", input_upper)
+    encoder.update()
+    print(
+        f"[tree] using {len(samples)} samples (limit={ts_limit}) "
+        f"pixel_shift={pixel_shift} input_upper={input_upper}"
+    )
+    log_tree_build(f"[tree] samples={len(samples)} pixel_shift={pixel_shift} input_upper={input_upper}")
+
+    r1_scales_exp = expand_channel_scales(r1.scale.astype(float), conv1_out_shape[1] * conv1_out_shape[2])
+    validate_scales("r1_scales_exp", r1_scales_exp)
+
+    conv1_w_int = conv1_w_eq.astype(np.int64)
+    conv1_b_int = conv1_b_eq.astype(np.int64)
+    conv1_row_sums = np.sum(conv1_w_int, axis=1, dtype=np.int64)
+    conv1_b_shifted = conv1_b_int - pixel_shift * conv1_row_sums
+
+    identity_pool1 = make_qscales_from_float(np.ones(pool1_w_eq.shape[0], dtype=np.float64))
+
+    qlayers = [
+        QLayer(conv1_w_int, conv1_b_shifted.astype(np.int64), True, make_qscales_from_float(r1_scales_exp)),
+        QLayer(pool1_w_eq, pool1_b_eq, True, identity_pool1),
+        QLayer(*lin1.export(), False, r3.expQScales()),
+    ]
+    log_tree_build(
+        f"[tree] qlayer_shapes="
+        f"L0={conv1_w_int.shape}/{conv1_b_shifted.shape};"
+        f"L1={pool1_w_eq.shape}/{pool1_b_eq.shape};"
+        f"L2={lin1.export()[0].shape}/{lin1.export()[1].shape}"
+    )
+
+    out.update(
+        {
+            "pixel_shift": pixel_shift,
+            "tree_sample_limit": ts_limit,
+            "encoder": encoder,
+            "qlayers": qlayers,
+            "samples": samples,
+        }
+    )
+    return out
+
+
+if __name__ == "__main__":
+    skip_tree_build = os.environ.get("SKIP_TREE_BUILD", "0") == "1"
+    if not NN2LOGIC_AVAILABLE:
+        warnings.warn(
+            "nn2logic no esta disponible en este entorno. "
+            "Se ejecutara entrenamiento/cuantizacion, pero se omitira la exportacion del arbol. "
+            f"Detalle import: {NN2LOGIC_IMPORT_ERROR}"
+        )
     if skip_tree_build:
+        ctx = qat_mnist_prepare_until_qlayers(build_qlayers=False)
         print("[info] SKIP_TREE_BUILD=1: se omite construccion/exportacion del arbol.")
     elif NN2LOGIC_AVAILABLE:
-        runtime_check = gurobi_runtime_check()
-        log_tree_build(f"[solver] runtime_check={runtime_check}")
-        if not runtime_check["ok"]:
-            raise RuntimeError(
-                "Fallo precheck de solver (Gurobi). "
-                "Posibles causas: paquete gurobipy no instalado, licencia no activa, o variables de entorno incompletas. "
-                f"Detalle: {runtime_check['error']}. "
-                "Revisa GRB_LICENSE_FILE/GUROBI_HOME y que la licencia sea valida para esta maquina."
-            )
-
-        # Limite de muestras para nn2logic (evita consumo excesivo de RAM al construir listas Python grandes).
-        # Puedes sobreescribirlo con la variable de entorno NN2LOGIC_SAMPLE_LIMIT.
-        train_count = len(full_train)
-        limit_raw = os.environ.get("NN2LOGIC_SAMPLE_LIMIT")
-        tree_sample_limit = train_count if limit_raw is None else int(limit_raw)
-        if tree_sample_limit <= 0:
-            raise RuntimeError("NN2LOGIC_SAMPLE_LIMIT debe ser > 0.")
-        tree_sample_limit = min(tree_sample_limit, train_count)
-        log_tree_build(
-            f"[tree] sample_limit={tree_sample_limit} train_count={train_count} "
-            f"(env={limit_raw if limit_raw is not None else 'FULL_TRAIN'})"
-        )
-
-        # Definimos 784 variables enteras de entrada (imagen escalada) en el encoder.
-        # Dataset para nn2logic: entrada cruda cuantizada de 784 pixeles.
-        samples = []
-        for x, y in islice(full_train, tree_sample_limit):
-            xs = extract_int_input_sample(x.to(device), mod)
-            samples.append((xs, int(y)))
-        validate_samples(samples, 28 * 28)
-
-        # InputEncoder en nn2logic modela enteros en [0, upperLimit].
-        # Como MNIST normalizado puede producir enteros negativos tras escalado,
-        # desplazamos x' = x + pixel_shift para cumplir dominio no negativo.
-        flat_vals = [v for xs, _ in samples for v in xs]
-        pixel_shift = int(max(0, -min(flat_vals)))
-        max_shifted = int(max(v + pixel_shift for v in flat_vals))
-        input_upper = max(255, max_shifted)
-        samples = [([int(v) + pixel_shift for v in xs], y) for xs, y in samples]
-        validate_samples(samples, 28 * 28)
-
-        encoder = InputEncoder()
-        for idx in range(28 * 28):
-            encoder.registerInt(f"x_{idx}", input_upper)
-        encoder.update()
-        print(
-            f"[tree] using {len(samples)} samples (limit={tree_sample_limit}) "
-            f"pixel_shift={pixel_shift} input_upper={input_upper}"
-        )
-        log_tree_build(
-            f"[tree] samples={len(samples)} pixel_shift={pixel_shift} input_upper={input_upper}"
-        )
-
-        r1_scales_exp = expand_channel_scales(r1.scale.astype(float), conv1_out_shape[1] * conv1_out_shape[2])
-        validate_scales("r1_scales_exp", r1_scales_exp)
-
-        conv1_w_int = conv1_w_eq.astype(np.int64)
-        conv1_b_int = conv1_b_eq.astype(np.int64)
-
-        # Compensacion del desplazamiento de entrada en la primera capa linealizada:
-        # W*x + b = W*x' + (b - shift*sum(W_row)).
-        conv1_row_sums = np.sum(conv1_w_int, axis=1, dtype=np.int64)
-        conv1_b_shifted = conv1_b_int - pixel_shift * conv1_row_sums
-
-        identity_pool1 = make_qscales_from_float(np.ones(pool1_w_eq.shape[0], dtype=np.float64))
-
-        # Conv linealizada + pool lineal + clasificador (sin ReLU en salida: logits).
-        # nn2logic exige relu=True en todas las capas salvo la ultima (SequentialCreator.hpp).
-        # Tras conv+ReLU las entradas al pool son >= 0; ReLU post-pool coincide con la red real.
-        qlayers = [
-            QLayer(conv1_w_int, conv1_b_shifted.astype(np.int64), True, make_qscales_from_float(r1_scales_exp)),
-            QLayer(pool1_w_eq, pool1_b_eq, True, identity_pool1),
-            QLayer(*lin1.export(), False, r3.expQScales()),
-        ]
-        log_tree_build(
-            f"[tree] qlayer_shapes="
-            f"L0={conv1_w_int.shape}/{conv1_b_shifted.shape};"
-            f"L1={pool1_w_eq.shape}/{pool1_b_eq.shape};"
-            f"L2={lin1.export()[0].shape}/{lin1.export()[1].shape}"
-        )
-
-        # Construccion y guardado del arbol.
+        ctx = qat_mnist_prepare_until_qlayers(build_qlayers=True)
         try:
-            tree = QTreeBuilder(StorageAdaptor(qlayers, samples), encoder)
+            tree = QTreeBuilder(StorageAdaptor(ctx["qlayers"], ctx["samples"]), ctx["encoder"])
             log_tree_build("[tree] QTreeBuilder created")
             print("[tree] store() inicio (barras Layer/Leaves/Constness)...", flush=True)
             t0 = time.perf_counter()
@@ -604,7 +833,7 @@ if __name__ == "__main__":
             log_tree_build("[tree] store completed")
             print("[tree] setDataset(samples) inicio (puede tardar con muchas muestras)...", flush=True)
             t1 = time.perf_counter()
-            out.setDataset(samples)
+            out.setDataset(ctx["samples"])
             print(f"[tree] setDataset fin en {time.perf_counter() - t1:.1f}s", flush=True)
             out_path = Path("qat-mnist-tree.json")
             print(f"[tree] save() inicio -> {out_path} (serializacion JSON, sin barra de progreso)...", flush=True)
@@ -622,17 +851,15 @@ if __name__ == "__main__":
                 "(3) reducir NN2LOGIC_SAMPLE_LIMIT para descartar agotamiento de recursos."
             ) from exc
     else:
-        print("[info] Export de arbol omitido: nn2logic no disponible.")
+        ctx = qat_mnist_prepare_until_qlayers(build_qlayers=False)
+        print("[info] Export de arbol omitido: nn2logic no disponible.", flush=True)
 
-    # Guardado auxiliar: pesos conv aplanados 2D para analisis/documentacion.
+    conv1 = ctx["conv1"]
     print("[info] guardando conv1_flattened_weights.npy ...", flush=True)
     np.save("conv1_flattened_weights.npy", conv1.export()[0])
     print("[info] pipeline terminado.", flush=True)
 
-    # Cierre: Gurobi/nn2logic (nativos) a veces retienen recursos hasta el apagado del interprete
-    # y en Windows la terminal puede parecer "colgada" sin prompt. Liberamos referencias grandes
-    # y forzamos salida del proceso para devolver CPU/RAM al SO de inmediato.
-    for _name in ("tree", "out", "samples", "qlayers", "encoder", "dumb", "frontend", "full_train", "full_test"):
+    for _name in ("tree", "out", "ctx", "samples", "qlayers", "encoder", "dumb", "frontend"):
         try:
             del globals()[_name]
         except KeyError:
