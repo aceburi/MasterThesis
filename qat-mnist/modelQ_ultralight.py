@@ -13,6 +13,9 @@ Variables de entorno:
   NN2LOGIC_SAMPLE_LIMIT limite de muestras (default: len(train))
   SKIP_TREE_BUILD=1     omitir arbol
   LOG_TREE_BUILD=1      log en qat-mnist-tree-build.log
+  ULTRALIGHT_TRAIN_BATCH / ULTRALIGHT_CALIB_BATCH (default 128)
+  ULTRALIGHT_PRETRAIN_EPOCHS (12) / ULTRALIGHT_QAT_EPOCHS (8)
+  ULTRALIGHT_PRETRAIN_LR (0.001) / ULTRALIGHT_QAT_LR (0.0002)
 """
 import gc
 import os
@@ -77,6 +80,26 @@ FEAT_DIM = 1 * 7 * 7
 DEFAULT_CKPT = "mnist_cnn_ultralight.ckpt"
 DEFAULT_TREE_JSON = "qat-mnist-tree-ultralight.json"
 
+# Entrenamiento por mini-batches (DataLoader); perfil por defecto ~0.906 / ~0.903 (cuant/dumb).
+TRAIN_BATCH_SIZE = int(os.environ.get("ULTRALIGHT_TRAIN_BATCH", "128"))
+CALIB_BATCH_SIZE = int(os.environ.get("ULTRALIGHT_CALIB_BATCH", "128"))
+TEST_BATCH_SIZE = 512
+PRETRAIN_EPOCHS = int(os.environ.get("ULTRALIGHT_PRETRAIN_EPOCHS", "12"))
+QAT_EPOCHS = int(os.environ.get("ULTRALIGHT_QAT_EPOCHS", "8"))
+PRETRAIN_LR = float(os.environ.get("ULTRALIGHT_PRETRAIN_LR", "0.001"))
+QAT_LR = float(os.environ.get("ULTRALIGHT_QAT_LR", "0.0002"))
+
+
+def train_epochs(model, optimizer, lossF, loader, device, epochs, tag="train"):
+    """Entrena `epochs` pasadas completas sobre `loader` (mini-batches)."""
+    for ep in range(epochs):
+        trainModel(model, optimizer, lossF, loader, device)
+        print(
+            f"[{tag}] epoch {ep + 1}/{epochs} | "
+            f"batch_size={loader.batch_size} batches/epoch={len(loader)}",
+            flush=True,
+        )
+
 
 class CNNUltraLight(nn.Module):
     """
@@ -122,34 +145,65 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     train_set, _ = random_split(full_train, [0.8, 0.2], torch.Generator().manual_seed(42))
     test_set = full_test
 
-    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-    calib_loader = DataLoader(full_train, batch_size=64, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=512, shuffle=False)
+    pin = device.type == "cuda"
+    train_loader = DataLoader(
+        train_set,
+        batch_size=TRAIN_BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=pin,
+    )
+    calib_loader = DataLoader(
+        full_train,
+        batch_size=CALIB_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin,
+    )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=TEST_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin,
+    )
 
     model = CNNUltraLight().to(device)
     lossF = nn.CrossEntropyLoss()
 
     print(
-        "[ultralight] CNN: conv 1x1x5 stride2 -> 14x14, AvgPool2x2 -> 7x7, lin 49->2; "
+        "[ultralight] CNN: conv 1->1, k=5 stride2 -> 14x14, AvgPool2x2 -> 7x7, lin 49->2; "
         f"arbol nn2logic sobre {FEAT_DIM} features (no pixeles)",
         flush=True,
     )
+    print(
+        f"[ultralight] entrenamiento por mini-batches: "
+        f"train_samples={len(train_set)} batch_size={TRAIN_BATCH_SIZE} "
+        f"batches/epoch={len(train_loader)} | "
+        f"calib_batch={CALIB_BATCH_SIZE} test_batch={TEST_BATCH_SIZE} | "
+        f"lr pretrain={PRETRAIN_LR} qat={QAT_LR}",
+        flush=True,
+    )
 
-    if os.path.exists(ckpt_path):
+    force_retrain = os.environ.get("ULTRALIGHT_RETRAIN", "0") == "1"
+    if os.path.exists(ckpt_path) and not force_retrain:
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"[ultralight] checkpoint cargado: {ckpt_path}", flush=True)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        for _ in range(5):
-            trainModel(model, optimizer, lossF, train_loader, device)
+        if force_retrain:
+            print("[ultralight] ULTRALIGHT_RETRAIN=1: reentrenando desde cero.", flush=True)
+        optimizer = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
+        train_epochs(model, optimizer, lossF, train_loader, device, PRETRAIN_EPOCHS, tag="pretrain")
         torch.save(model.state_dict(), ckpt_path)
+        print(f"[ultralight] checkpoint guardado: {ckpt_path}", flush=True)
 
     quantize(model, weights=qint8, activations=qint8)
     with Calibration():
         modelCompute(model, calib_loader, device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
-    for _ in range(3):
-        trainModel(model, optimizer, lossF, train_loader, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=QAT_LR)
+    train_epochs(model, optimizer, lossF, train_loader, device, QAT_EPOCHS, tag="qat")
+    print("[ultralight] accuracy CNN cuantizada (test):", flush=True)
     testModel(model, test_loader, device)
 
     model.eval()
@@ -161,7 +215,7 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     layers = []
 
     mod = DumbScaler(1.0 / input_scale, trackMax=True)
-    modelCompute(mod, calib_loader)
+    modelCompute(mod, calib_loader, device)
     layers.append(mod)
 
     p1 = layerBaseParams(state_dict, "conv1")
@@ -177,7 +231,7 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     r1i = DumbScaler(input_scale * p1["weight_scale"], trackMax=True)
     layers.append(r1i)
-    modelCompute(nn.Sequential(*layers), calib_loader)
+    modelCompute(nn.Sequential(*layers), calib_loader, device)
     r1 = DumbScaler((amm_max * input_scale * p1["weight_scale"]) / max(r1i.max, 1.0))
     layers[-1] = r1
     input_scale = (amm_max * input_scale) / max(r1i.max, 1.0)
@@ -193,11 +247,12 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     r2i = DumbScaler(input_scale * p_lin["weight_scale"], trackMax=True)
     layers.append(r2i)
-    modelCompute(nn.Sequential(*layers), calib_loader)
+    modelCompute(nn.Sequential(*layers), calib_loader, device)
     r2 = DumbScaler((amm_max * input_scale * p_lin["weight_scale"]) / max(r2i.max, 1.0))
     layers[-1] = r2
 
     dumb = nn.Sequential(*layers).to(device)
+    print("[ultralight] accuracy red dumb / nn2logic (test):", flush=True)
     testModel(dumb, test_loader, device)
 
     frontend = nn.Sequential(mod, conv1, nn.ReLU(), nn.AvgPool2d(2, 2), r1, nn.Flatten())
