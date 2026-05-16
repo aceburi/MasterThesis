@@ -1,12 +1,11 @@
 """
-CNN ultra-ligera para MNIST par/impar + export nn2logic optimizado en RAM.
+CNN ultra-ligera para MNIST par/impar + export nn2logic.
 
-Diferencias clave frente a modelQ.py:
-- Arquitectura: 1 canal conv (stride 2) + AvgPool2d (no MaxPool; avg es lineal en nn2logic).
-- Entrada al arbol: vector de 49 features tras conv+avgpool+requant (como occupancy con 22 vars),
-  NO 784 pixeles ni matrices conv/pool dentro de QTreeBuilder.
-- Arbol: 2 QLayer (49->4 ReLU, 4->2) como occupancy; nn2logic exige relu=True en todas salvo la ultima.
-- Por defecto usa todas las muestras de train (60k) si no defines NN2LOGIC_SAMPLE_LIMIT.
+El arbol incluye TODA la CNN cuantizada como en modelQ.py:
+  entrada 784 pixeles -> QLayer(conv linealizada) -> QLayer(avgpool lineal) ->
+  QLayer(lin1) -> QLayer(lin2).
+AvgPool (no MaxPool): media 2x2 como matriz entera + escalas 1/4.
+Por defecto NN2LOGIC_SAMPLE_LIMIT = len(train) si no se define.
 
 Variables de entorno:
   QAT_MNIST_TREE_JSON   ruta del JSON (default: qat-mnist-tree-ultralight.json)
@@ -37,14 +36,18 @@ from modelQ import (
     DumbLinear,
     DumbScaler,
     classify_gurobi_error,
-    extract_int_frontend_sample,
+    conv2d_to_linear,
+    expand_channel_scales,
+    extract_int_input_sample,
     gurobi_runtime_check,
     layerBaseParams,
     log_tree_build,
+    make_qscales_from_float,
     modelCompute,
     testModel,
     trainModel,
     validate_samples,
+    validate_scales,
 )
 
 # nn2logic (mismo patron que modelQ.py)
@@ -75,9 +78,10 @@ except ImportError:
 
 torch.manual_seed(64)
 
-# Tras conv stride 2 (28->14) + avgpool 2x2 (14->7), 1 canal -> 49 entradas al arbol.
+# Tras conv stride 2 (28->14) + avgpool 2x2 (14->7) -> 49 features para lin1.
 FEAT_DIM = 1 * 7 * 7
-LIN_HIDDEN = 4  # minimo para nn2logic (capa intermedia con ReLU)
+PIXEL_DIM = 28 * 28
+LIN_HIDDEN = 4
 DEFAULT_CKPT = "mnist_cnn_ultralight.ckpt"
 DEFAULT_TREE_JSON = "qat-mnist-tree-ultralight.json"
 
@@ -89,6 +93,28 @@ PRETRAIN_EPOCHS = int(os.environ.get("ULTRALIGHT_PRETRAIN_EPOCHS", "12"))
 QAT_EPOCHS = int(os.environ.get("ULTRALIGHT_QAT_EPOCHS", "8"))
 PRETRAIN_LR = float(os.environ.get("ULTRALIGHT_PRETRAIN_LR", "0.001"))
 QAT_LR = float(os.environ.get("ULTRALIGHT_QAT_LR", "0.0002"))
+
+
+def build_avgpool2d_linear(channels, h_in, w_in, kernel=2, stride=2):
+    """AvgPool 2x2 como capa lineal (suma de la ventana; escala 1/kernel^2 en QScales)."""
+    h_out = (h_in - kernel) // stride + 1
+    w_out = (w_in - kernel) // stride + 1
+    in_dim = channels * h_in * w_in
+    out_dim = channels * h_out * w_out
+    mat = np.zeros((out_dim, in_dim), dtype=np.int64)
+    row = 0
+    for c in range(channels):
+        for oh in range(h_out):
+            for ow in range(w_out):
+                for dh in range(kernel):
+                    for dw in range(kernel):
+                        ih = oh * stride + dh
+                        iw = ow * stride + dw
+                        col = c * (h_in * w_in) + ih * w_in + iw
+                        mat[row, col] = 1
+                row += 1
+    bias = np.zeros(out_dim, dtype=np.int64)
+    return mat, bias, (channels, h_out, w_out)
 
 
 def train_epochs(model, optimizer, lossF, loader, device, epochs, tag="train"):
@@ -175,8 +201,8 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     lossF = nn.CrossEntropyLoss()
 
     print(
-        f"[ultralight] CNN: conv+AvgPool -> {FEAT_DIM} feats; lin {FEAT_DIM}->{LIN_HIDDEN} ReLU -> 2; "
-        f"arbol nn2logic: 2 QLayer (relu salvo ultima)",
+        f"[ultralight] CNN: conv 1->1 stride2, AvgPool, lin {FEAT_DIM}->{LIN_HIDDEN}->2; "
+        f"arbol nn2logic: {PIXEL_DIM} pixeles + 4 QLayer (conv+avgpool+lin+lin)",
         flush=True,
     )
     print(
@@ -320,60 +346,83 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     ts_limit = min(ts_limit, train_count)
 
     log_tree_build(
-        f"[ultralight][tree] sample_limit={ts_limit} train_count={train_count} feat_dim={FEAT_DIM}"
+        f"[ultralight][tree] sample_limit={ts_limit} train_count={train_count} pixels={PIXEL_DIM}"
     )
 
     samples = []
     for x, y in islice(full_train, ts_limit):
-        xs = extract_int_frontend_sample(x.to(device), frontend)
+        xs = extract_int_input_sample(x.to(device), mod)
         samples.append((xs, int(y)))
-    validate_samples(samples, FEAT_DIM)
+    validate_samples(samples, PIXEL_DIM)
 
     flat_vals = [v for xs, _ in samples for v in xs]
-    feat_shift = int(max(0, -min(flat_vals))) if flat_vals else 0
-    max_shifted = int(max((v + feat_shift) for v in flat_vals)) if flat_vals else 127
-    feat_upper = max(127, max_shifted)
-    samples = [([int(v) + feat_shift for v in xs], y) for xs, y in samples]
-    validate_samples(samples, FEAT_DIM)
+    pixel_shift = int(max(0, -min(flat_vals))) if flat_vals else 0
+    max_shifted = int(max((v + pixel_shift) for v in flat_vals)) if flat_vals else 127
+    input_upper = max(255, max_shifted)
+    samples = [([int(v) + pixel_shift for v in xs], y) for xs, y in samples]
+    validate_samples(samples, PIXEL_DIM)
 
     encoder = InputEncoder()
-    for idx in range(FEAT_DIM):
-        encoder.registerInt(f"x_{idx}", feat_upper)
+    for idx in range(PIXEL_DIM):
+        encoder.registerInt(f"x_{idx}", input_upper)
     encoder.update()
 
+    conv1_w_eq, _, conv1_out_shape = conv2d_to_linear(
+        p1["weight"],
+        p1["bias"],
+        (1, 28, 28),
+        stride=model.conv1.stride[0],
+        padding=model.conv1.padding[0],
+        print_shapes=True,
+    )
+    conv1_b_ch = np.round(
+        p1["bias"] / (float(state_dict["conv1.input_scale"].item()) * p1["weight_scale"])
+    ).astype(np.int64)
+    conv1_b_eq = np.repeat(conv1_b_ch, conv1_out_shape[1] * conv1_out_shape[2])
+
+    pool1_w_eq, pool1_b_eq, pool1_out_shape = build_avgpool2d_linear(
+        conv1_out_shape[0], conv1_out_shape[1], conv1_out_shape[2], kernel=2, stride=2
+    )
+    assert pool1_out_shape == (1, 7, 7), f"pool out {pool1_out_shape} != (1,7,7)"
+
     print(
-        f"[ultralight][tree] samples={len(samples)} feat_dim={FEAT_DIM} "
-        f"feat_shift={feat_shift} feat_upper={feat_upper} "
-        f"(QLayer L0 {FEAT_DIM}->{LIN_HIDDEN} relu, L1 {LIN_HIDDEN}->2)",
+        f"[ultralight][tree] samples={len(samples)} pixels={PIXEL_DIM} "
+        f"pixel_shift={pixel_shift} conv_eq={conv1_w_eq.shape} pool_eq={pool1_w_eq.shape}",
         flush=True,
     )
     log_tree_build(
-        f"[ultralight][tree] samples={len(samples)} feat_shift={feat_shift} feat_upper={feat_upper}"
+        f"[ultralight][tree] samples={len(samples)} pixel_shift={pixel_shift} input_upper={input_upper}"
     )
 
+    r1_scales_exp = expand_channel_scales(r1.scale.astype(float), conv1_out_shape[1] * conv1_out_shape[2])
+    validate_scales("r1_scales_exp", r1_scales_exp)
+
+    conv1_w_int = conv1_w_eq.astype(np.int64)
+    conv1_b_int = conv1_b_eq.astype(np.int64)
+    conv1_row_sums = np.sum(conv1_w_int, axis=1, dtype=np.int64)
+    conv1_b_shifted = conv1_b_int - pixel_shift * conv1_row_sums
+
+    avgpool_scales = make_qscales_from_float(np.ones(pool1_w_eq.shape[0], dtype=np.float64) / 4.0)
+
     w1, b1 = lin1_d.export()
-    w1_int = np.asarray(w1, dtype=np.int64)
-    b1_int = np.asarray(b1, dtype=np.int64).reshape(-1)
-    if feat_shift:
-        b1_int = b1_int - feat_shift * np.sum(w1_int, axis=1, dtype=np.int64)
-
     w2, b2 = lin2_d.export()
-    w2_int = np.asarray(w2, dtype=np.int64)
-    b2_int = np.asarray(b2, dtype=np.int64).reshape(-1)
 
-    # nn2logic SequentialCreator: size>1; capas 0..n-2 con relu; ultima sin relu
+    # nn2logic: >=2 capas; relu=True en todas salvo la ultima
     qlayers = [
-        QLayer(w1_int, b1_int, True, r2.expQScales()),
-        QLayer(w2_int, b2_int, False, r3.expQScales()),
+        QLayer(conv1_w_int, conv1_b_shifted.astype(np.int64), True, make_qscales_from_float(r1_scales_exp)),
+        QLayer(pool1_w_eq, pool1_b_eq, True, avgpool_scales),
+        QLayer(np.asarray(w1, dtype=np.int64), np.asarray(b1, dtype=np.int64).reshape(-1), True, r2.expQScales()),
+        QLayer(np.asarray(w2, dtype=np.int64), np.asarray(b2, dtype=np.int64).reshape(-1), False, r3.expQScales()),
     ]
     log_tree_build(
         f"[ultralight][tree] qlayer_shapes "
-        f"L0={w1_int.shape}/{b1_int.shape} L1={w2_int.shape}/{b2_int.shape}"
+        f"L0={conv1_w_int.shape} L1={pool1_w_eq.shape} "
+        f"L2={w1.shape} L3={w2.shape}"
     )
 
     out.update(
         {
-            "feat_shift": feat_shift,
+            "pixel_shift": pixel_shift,
             "tree_sample_limit": ts_limit,
             "encoder": encoder,
             "qlayers": qlayers,
