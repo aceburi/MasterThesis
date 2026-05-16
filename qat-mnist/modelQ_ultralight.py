@@ -5,7 +5,7 @@ Diferencias clave frente a modelQ.py:
 - Arquitectura: 1 canal conv (stride 2) + AvgPool2d (no MaxPool; avg es lineal en nn2logic).
 - Entrada al arbol: vector de 49 features tras conv+avgpool+requant (como occupancy con 22 vars),
   NO 784 pixeles ni matrices conv/pool dentro de QTreeBuilder.
-- Arbol: lin1 (49->2) + capa identidad 2->2 (nn2logic exige >=2 QLayer; no cambia el clasificador).
+- Arbol: 2 QLayer (49->4 ReLU, 4->2) como occupancy; nn2logic exige relu=True en todas salvo la ultima.
 - Por defecto usa todas las muestras de train (60k) si no defines NN2LOGIC_SAMPLE_LIMIT.
 
 Variables de entorno:
@@ -41,7 +41,6 @@ from modelQ import (
     gurobi_runtime_check,
     layerBaseParams,
     log_tree_build,
-    make_qscales_from_float,
     modelCompute,
     testModel,
     trainModel,
@@ -78,6 +77,7 @@ torch.manual_seed(64)
 
 # Tras conv stride 2 (28->14) + avgpool 2x2 (14->7), 1 canal -> 49 entradas al arbol.
 FEAT_DIM = 1 * 7 * 7
+LIN_HIDDEN = 4  # minimo para nn2logic (capa intermedia con ReLU)
 DEFAULT_CKPT = "mnist_cnn_ultralight.ckpt"
 DEFAULT_TREE_JSON = "qat-mnist-tree-ultralight.json"
 
@@ -105,21 +105,23 @@ def train_epochs(model, optimizer, lossF, loader, device, epochs, tag="train"):
 class CNNUltraLight(nn.Module):
     """
     CNN minima: entrada 28x28 sin cambiar tamano.
-    conv 1->1, k=5, stride=2 -> 14x14; AvgPool 2x2 -> 7x7; lin 49->2.
+    conv 1->1, k=5, stride=2 -> 14x14; AvgPool 2x2 -> 7x7; lin 49->4 ReLU -> 4->2.
   """
 
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 1, kernel_size=5, stride=2, padding=2)
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.lin1 = nn.Linear(FEAT_DIM, 2)
+        self.lin1 = nn.Linear(FEAT_DIM, LIN_HIDDEN)
+        self.lin2 = nn.Linear(LIN_HIDDEN, 2)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.conv1(x))
         x = self.pool(x)
         x = x.view(x.size(0), -1)
-        return self.lin1(x)
+        x = self.relu(self.lin1(x))
+        return self.lin2(x)
 
 
 def qat_mnist_ultralight_prepare_until_qlayers(
@@ -173,8 +175,8 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     lossF = nn.CrossEntropyLoss()
 
     print(
-        "[ultralight] CNN: conv 1->1, k=5 stride2 -> 14x14, AvgPool2x2 -> 7x7, lin 49->2; "
-        f"arbol nn2logic sobre {FEAT_DIM} features (no pixeles)",
+        f"[ultralight] CNN: conv+AvgPool -> {FEAT_DIM} feats; lin {FEAT_DIM}->{LIN_HIDDEN} ReLU -> 2; "
+        f"arbol nn2logic: 2 QLayer (relu salvo ultima)",
         flush=True,
     )
     print(
@@ -188,8 +190,14 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     force_retrain = os.environ.get("ULTRALIGHT_RETRAIN", "0") == "1"
     if os.path.exists(ckpt_path) and not force_retrain:
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        print(f"[ultralight] checkpoint cargado: {ckpt_path}", flush=True)
+        try:
+            model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            print(f"[ultralight] checkpoint cargado: {ckpt_path}", flush=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"No se pudo cargar {ckpt_path} (arquitectura 49->{LIN_HIDDEN}->2). "
+                "Borra el .ckpt antiguo o usa ULTRALIGHT_RETRAIN=1."
+            ) from exc
     else:
         if force_retrain:
             print("[ultralight] ULTRALIGHT_RETRAIN=1: reentrenando desde cero.", flush=True)
@@ -239,18 +247,34 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     layers.append(nn.Flatten())
 
-    p_lin = layerBaseParams(state_dict, "lin1")
-    lin1 = DumbLinear(
-        p_lin["weight"],
-        np.round(p_lin["bias"] / (input_scale * p_lin["weight_scale"])),
+    p_l1 = layerBaseParams(state_dict, "lin1")
+    lin1_d = DumbLinear(
+        p_l1["weight"],
+        np.round(p_l1["bias"] / (input_scale * p_l1["weight_scale"])),
     )
-    layers.append(lin1)
+    layers.append(lin1_d)
 
-    r2i = DumbScaler(input_scale * p_lin["weight_scale"], trackMax=True)
+    r2i = DumbScaler(input_scale * p_l1["weight_scale"], trackMax=True)
     layers.append(r2i)
     modelCompute(nn.Sequential(*layers), calib_loader, device)
-    r2 = DumbScaler((amm_max * input_scale * p_lin["weight_scale"]) / max(r2i.max, 1.0))
+    r2 = DumbScaler((amm_max * input_scale * p_l1["weight_scale"]) / max(r2i.max, 1.0))
     layers[-1] = r2
+    input_scale = (amm_max * input_scale) / max(r2i.max, 1.0)
+
+    layers.append(nn.ReLU())
+
+    p_l2 = layerBaseParams(state_dict, "lin2")
+    lin2_d = DumbLinear(
+        p_l2["weight"],
+        np.round(p_l2["bias"] / (input_scale * p_l2["weight_scale"])),
+    )
+    layers.append(lin2_d)
+
+    r3i = DumbScaler(input_scale * p_l2["weight_scale"], trackMax=True)
+    layers.append(r3i)
+    modelCompute(nn.Sequential(*layers), calib_loader, device)
+    r3 = DumbScaler((amm_max * input_scale * p_l2["weight_scale"]) / max(r3i.max, 1.0))
+    layers[-1] = r3
 
     dumb = nn.Sequential(*layers).to(device)
     print("[ultralight] accuracy red dumb / nn2logic (test):", flush=True)
@@ -267,9 +291,11 @@ def qat_mnist_ultralight_prepare_until_qlayers(
         "conv1": conv1,
         "dumb": dumb,
         "frontend": frontend,
-        "lin1": lin1,
+        "lin1": lin1_d,
+        "lin2": lin2_d,
         "r1": r1,
         "r2": r2,
+        "r3": r3,
         "model": model,
         "feat_dim": FEAT_DIM,
     }
@@ -317,30 +343,32 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     print(
         f"[ultralight][tree] samples={len(samples)} feat_dim={FEAT_DIM} "
-        f"feat_shift={feat_shift} feat_upper={feat_upper} (2 QLayer: lin 49->2 + id 2->2)",
+        f"feat_shift={feat_shift} feat_upper={feat_upper} "
+        f"(QLayer L0 {FEAT_DIM}->{LIN_HIDDEN} relu, L1 {LIN_HIDDEN}->2)",
         flush=True,
     )
     log_tree_build(
         f"[ultralight][tree] samples={len(samples)} feat_shift={feat_shift} feat_upper={feat_upper}"
     )
 
-    lin_w, lin_b = lin1.export()
-    lin_w_int = np.asarray(lin_w, dtype=np.int64)
-    lin_b_int = np.asarray(lin_b, dtype=np.int64).reshape(-1)
+    w1, b1 = lin1_d.export()
+    w1_int = np.asarray(w1, dtype=np.int64)
+    b1_int = np.asarray(b1, dtype=np.int64).reshape(-1)
     if feat_shift:
-        lin_b_int = lin_b_int - feat_shift * np.sum(lin_w_int, axis=1, dtype=np.int64)
+        b1_int = b1_int - feat_shift * np.sum(w1_int, axis=1, dtype=np.int64)
 
-    # nn2logic: assert(m_layers.size() > 1) en SequentialCreator.hpp
-    id2_w = np.eye(2, dtype=np.int64)
-    id2_b = np.zeros(2, dtype=np.int64)
-    id2_scales = make_qscales_from_float(np.ones(2, dtype=np.float64))
+    w2, b2 = lin2_d.export()
+    w2_int = np.asarray(w2, dtype=np.int64)
+    b2_int = np.asarray(b2, dtype=np.int64).reshape(-1)
+
+    # nn2logic SequentialCreator: size>1; capas 0..n-2 con relu; ultima sin relu
     qlayers = [
-        QLayer(lin_w_int, lin_b_int, False, r2.expQScales()),
-        QLayer(id2_w, id2_b, False, id2_scales),
+        QLayer(w1_int, b1_int, True, r2.expQScales()),
+        QLayer(w2_int, b2_int, False, r3.expQScales()),
     ]
     log_tree_build(
         f"[ultralight][tree] qlayer_shapes "
-        f"L0={lin_w_int.shape}/{lin_b_int.shape} L1={id2_w.shape}/{id2_b.shape}"
+        f"L0={w1_int.shape}/{b1_int.shape} L1={w2_int.shape}/{b2_int.shape}"
     )
 
     out.update(
