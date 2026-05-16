@@ -5,7 +5,7 @@ Diferencias clave frente a modelQ.py:
 - Arquitectura: 1 canal conv (stride 2) + AvgPool2d (no MaxPool; avg es lineal en nn2logic).
 - Entrada al arbol: vector de 49 features tras conv+avgpool+requant (como occupancy con 22 vars),
   NO 784 pixeles ni matrices conv/pool dentro de QTreeBuilder.
-- Un solo QLayer (lin1: 49 -> 2) para minimizar MIP/rutas.
+- Arbol: lin1 (49->2) + capa identidad 2->2 (nn2logic exige >=2 QLayer; no cambia el clasificador).
 - Por defecto usa todas las muestras de train (60k) si no defines NN2LOGIC_SAMPLE_LIMIT.
 
 Variables de entorno:
@@ -41,6 +41,7 @@ from modelQ import (
     gurobi_runtime_check,
     layerBaseParams,
     log_tree_build,
+    make_qscales_from_float,
     modelCompute,
     testModel,
     trainModel,
@@ -316,7 +317,7 @@ def qat_mnist_ultralight_prepare_until_qlayers(
 
     print(
         f"[ultralight][tree] samples={len(samples)} feat_dim={FEAT_DIM} "
-        f"feat_shift={feat_shift} feat_upper={feat_upper} (1 QLayer lin1)",
+        f"feat_shift={feat_shift} feat_upper={feat_upper} (2 QLayer: lin 49->2 + id 2->2)",
         flush=True,
     )
     log_tree_build(
@@ -329,9 +330,17 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     if feat_shift:
         lin_b_int = lin_b_int - feat_shift * np.sum(lin_w_int, axis=1, dtype=np.int64)
 
-    qlayers = [QLayer(lin_w_int, lin_b_int, False, r2.expQScales())]
+    # nn2logic: assert(m_layers.size() > 1) en SequentialCreator.hpp
+    id2_w = np.eye(2, dtype=np.int64)
+    id2_b = np.zeros(2, dtype=np.int64)
+    id2_scales = make_qscales_from_float(np.ones(2, dtype=np.float64))
+    qlayers = [
+        QLayer(lin_w_int, lin_b_int, False, r2.expQScales()),
+        QLayer(id2_w, id2_b, False, id2_scales),
+    ]
     log_tree_build(
-        f"[ultralight][tree] qlayer_shapes L0={lin_w_int.shape}/{lin_b_int.shape}"
+        f"[ultralight][tree] qlayer_shapes "
+        f"L0={lin_w_int.shape}/{lin_b_int.shape} L1={id2_w.shape}/{id2_b.shape}"
     )
 
     out.update(
