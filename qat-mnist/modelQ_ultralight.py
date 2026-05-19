@@ -15,6 +15,7 @@ Variables de entorno:
   ULTRALIGHT_TRAIN_BATCH / ULTRALIGHT_CALIB_BATCH (default 128)
   ULTRALIGHT_PRETRAIN_EPOCHS (12) / ULTRALIGHT_QAT_EPOCHS (8)
   ULTRALIGHT_PRETRAIN_LR (0.001) / ULTRALIGHT_QAT_LR (0.0002)
+  ULTRALIGHT_SKIP_QAT_TRAIN=1  en eval: calibrar+freeze sin re-entrenar QAT (mas rapido)
 """
 import gc
 import os
@@ -236,8 +237,16 @@ def qat_mnist_ultralight_prepare_until_qlayers(
     with Calibration():
         modelCompute(model, calib_loader, device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=QAT_LR)
-    train_epochs(model, optimizer, lossF, train_loader, device, QAT_EPOCHS, tag="qat")
+    skip_qat_train = os.environ.get("ULTRALIGHT_SKIP_QAT_TRAIN", "0") == "1"
+    if skip_qat_train:
+        print(
+            "[ultralight] ULTRALIGHT_SKIP_QAT_TRAIN=1: omitiendo re-QAT "
+            "(usa el mismo .ckpt que al generar el arbol).",
+            flush=True,
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=QAT_LR)
+        train_epochs(model, optimizer, lossF, train_loader, device, QAT_EPOCHS, tag="qat")
     print("[ultralight] accuracy CNN cuantizada (test):", flush=True)
     testModel(model, test_loader, device)
 

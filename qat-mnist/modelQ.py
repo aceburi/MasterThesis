@@ -484,30 +484,31 @@ def run_tree_metrics_qat(
     print(f"  arbol: {tree_json_path}", flush=True)
     print(f"  TREE_EVAL_LIMIT={eval_limit}  TREE_FAST_METRICS={int(fast_metrics_only)}", flush=True)
 
-    stats = QTreeAnalyze(StorageAdaptor(os.path.abspath(tree_json_path)))
-    with open(analyze_filename, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2, default=str)
-    print(f"[tree-metrics] QTreeAnalyze guardado en: {analyze_filename}", flush=True)
-    print("[tree-metrics] --- QTreeAnalyze (salida completa, consola) ---", flush=True)
-    try:
-        print(json.dumps(stats, indent=2, ensure_ascii=False, default=str), flush=True)
-    except (TypeError, ValueError):
-        print(str(stats), flush=True)
-    print("[tree-metrics] --- fin QTreeAnalyze ---", flush=True)
-
-    if fast_metrics_only:
-        print(
-            f"[tree-metrics] modo rapido (sin path matching), tiempo={time.perf_counter() - t0:.2f}s",
-            flush=True,
-        )
-        print("=" * 72, flush=True)
-        return
+    if os.environ.get("TREE_SKIP_ANALYZE", "0") != "1":
+        stats = QTreeAnalyze(StorageAdaptor(os.path.abspath(tree_json_path)))
+        with open(analyze_filename, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, default=str)
+        print(f"[tree-metrics] QTreeAnalyze guardado en: {analyze_filename}", flush=True)
+        print("[tree-metrics] --- QTreeAnalyze (salida completa, consola) ---", flush=True)
+        try:
+            print(json.dumps(stats, indent=2, ensure_ascii=False, default=str), flush=True)
+        except (TypeError, ValueError):
+            print(str(stats), flush=True)
+        print("[tree-metrics] --- fin QTreeAnalyze ---", flush=True)
+    else:
+        print("[tree-metrics] TREE_SKIP_ANALYZE=1: omitiendo QTreeAnalyze.", flush=True)
 
     with open(tree_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     layers_json = doc["layers"]
-    paths_json = doc["paths"]
-    print(f"[tree-metrics] paths={len(paths_json)} layers={len(layers_json)}", flush=True)
+    paths_json = doc["paths"] if not fast_metrics_only else []
+    print(
+        f"[tree-metrics] layers={len(layers_json)} paths={len(paths_json)} "
+        f"fast={int(fast_metrics_only)}",
+        flush=True,
+    )
+    if fast_metrics_only:
+        print("[tree-metrics] modo rapido: cadena QLayer sin path matching.", flush=True)
 
     metric_chain = BinaryAccuracy().to(device)
     counts = {
@@ -521,7 +522,7 @@ def run_tree_metrics_qat(
     }
 
     max_paths_warn = int(os.environ.get("TREE_PATH_WARN", "4000"))
-    if len(paths_json) > max_paths_warn:
+    if not fast_metrics_only and len(paths_json) > max_paths_warn:
         print(
             f"[tree-metrics] aviso: {len(paths_json)} paths; matching puede ser lento. "
             f"Usa TREE_FAST_METRICS=1 o reduce TREE_EVAL_LIMIT.",
@@ -544,6 +545,9 @@ def run_tree_metrics_qat(
         pred_chain = int(np.argmax(logits))
         metric_chain.update(torch.tensor([pred_chain], device=device), torch.tensor([int(y)], device=device))
         counts["chain_eval"] += 1
+
+        if fast_metrics_only:
+            continue
 
         matched = [p for p in paths_json if path_matches_sample(p, layers_json, x_shift)]
         if len(matched) == 0:
