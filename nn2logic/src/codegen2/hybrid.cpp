@@ -31,7 +31,7 @@ std::set<std::pair<size_t,size_t>> codegen2::HybridGen::obtainRequired(std::pair
         for (size_t i = 0; i < weights.size(); ++i) {
             if (weights[i] == 0) continue;
 
-            auto potCand = std::make_pair(inp.first-1, i);
+            auto potCand = std::make_pair(work.first - 1, i);
             if (!isScheduled[potCand] && toRet.find(potCand) == toRet.end()) {
                 toRet.insert(potCand);
                 worklist.push(potCand);
