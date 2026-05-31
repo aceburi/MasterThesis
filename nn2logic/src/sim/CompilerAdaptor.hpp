@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <cstdlib>
 #include <sstream>
 #include <algorithm>
 #include <cassert>
@@ -59,7 +60,9 @@ public:
 
     bool compile() const {
         //auto res = executeCommand(fmt::format("/bin/bash -c 'cd \"{}\";PATH=$PATH:/opt/riscv/bin make &> compilelog.txt'", m_dir.string()));
-        auto res = executeCommand(fmt::format("/bin/bash -c 'cd \"{}\";PATH=$PATH:/opt/riscv/bin make &> /dev/null'", m_dir.string()));
+        const char* riscvBinEnv = std::getenv("NN2LOGIC_RISCV_BIN");
+        const std::string riscvBin = riscvBinEnv ? riscvBinEnv : "/opt/riscv/bin";
+        auto res = executeCommand(fmt::format("/bin/bash -c 'cd \"{}\";PATH=$PATH:{} make &> /dev/null'", m_dir.string(), riscvBin));
         
         if (res.status < 0)
             throw std::runtime_error(res.output);

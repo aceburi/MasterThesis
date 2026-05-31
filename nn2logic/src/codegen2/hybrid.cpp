@@ -310,8 +310,13 @@ void codegen2::HybridGen::finalize() {
 
 
     // FIXME: move output neurons to out
-    code.push_back(std::make_shared<codegen::c::RawStatement>("out[0] = x_2_00;\n"));
-    code.push_back(std::make_shared<codegen::c::RawStatement>("out[1] = x_2_01;\n"));
+    // salida dinamica: ultima capa (generaliza el hardcode x_2_* a N capas)
+    const size_t lastLayer = layers.size() - 1;
+    const size_t numOut = layers.back().numNeurons();
+    for (size_t o = 0; o < numOut; ++o) {
+        code.push_back(std::make_shared<codegen::c::RawStatement>(
+            fmt::format("out[{}] = x_{}_{:02d};\n", o, lastLayer, o)));
+    }
     //conti.create<codegen::c::RawStatement>("out[0] = x_2_00;\n");
     //conti.create<codegen::c::RawStatement>("out[1] = x_2_01;\n");
 }
@@ -726,6 +731,11 @@ void codegen2::HybridGenSimple::finalize() {  // FIXME
 
 
     // FIXME: move output neurons to out
-    code.push_back(std::make_shared<codegen::c::RawStatement>("out[0] = x_2_00;\n"));
-    code.push_back(std::make_shared<codegen::c::RawStatement>("out[1] = x_2_01;\n"));
+    // salida dinamica: ultima capa (generaliza el hardcode x_2_* a N capas)
+    const size_t lastLayer = layers.size() - 1;
+    const size_t numOut = layers.back().numNeurons();
+    for (size_t o = 0; o < numOut; ++o) {
+        code.push_back(std::make_shared<codegen::c::RawStatement>(
+            fmt::format("out[{}] = x_{}_{:02d};\n", o, lastLayer, o)));
+    }
 }

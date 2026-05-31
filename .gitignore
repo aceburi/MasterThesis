@@ -16,3 +16,14 @@ tmp_run_*.log
 nn2logic/build/
 nn2logic/build311/
 tools/vcpkg/
+
+# Toolchain RISC-V extraido en local (no subir, son cientos de MB)
+xpack-riscv-none-elf-gcc-*/
+riscv-isa-sim*/
+*.tar.gz
+
+# Arbol ultralight (1.1 GB, supera el limite de GitHub)
+qat-mnist-tree-ultralight-*.json
+
+# Codigo C generado (regenerable con hybrid_codegen.py)
+qat-mnist/hybrid_c_ultralight/

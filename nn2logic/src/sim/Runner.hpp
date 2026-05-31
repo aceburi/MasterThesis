@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
+#include <cstdlib>
 #include <fmt/format.h>
 #include "CompilerAdaptor.hpp"
 
@@ -37,8 +39,10 @@ public:
         ca.addFile(m_srcFile.string(), m_isHybrid ? "hybrid.c" : "network.c");
         assert(ca.compile());
 
-        // execute
-        auto res = executeCommand(fmt::format("/opt/riscv/bin/spike --isa=RV32IMAC_ZICSR {}", ca.get().string()));
+        // execute (ruta del toolchain RISC-V configurable via NN2LOGIC_RISCV_BIN)
+        const char* riscvBinEnv = std::getenv("NN2LOGIC_RISCV_BIN");
+        const std::string riscvBin = riscvBinEnv ? riscvBinEnv : "/opt/riscv/bin";
+        auto res = executeCommand(fmt::format("{}/spike --isa=RV32IMAC_ZICSR {}", riscvBin, ca.get().string()));
         assert(res.status >= 0);
 
 

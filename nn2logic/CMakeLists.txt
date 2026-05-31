@@ -12,7 +12,7 @@ set(GUROBI_DIR "/Library/gurobi1101/macos_universal2" "~/gurobi1101/linux64")  #
 
 # configure how long a path is allowed to be
 # set to 0 to use boost::dynamic_bitset instead (slower)
-set(MAX_PATH_LENGTH 64)
+set(MAX_PATH_LENGTH 256)
 
 
 # otherwise FMT will cry
