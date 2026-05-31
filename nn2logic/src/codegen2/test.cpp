@@ -46,6 +46,30 @@ size_t sumPathVisitFreq(const std::vector<path::Path>& paths) {
     });
 }
 
+// Capa donde PermScheduler inserta comprobaciones del arbol. En occupancy (FC 3 capas)
+// casi siempre es capa 1; en CNN las decisiones IIS suelen estar en capa 0 (conv+ReLU).
+static size_t pickSchedLayerIdx(const std::vector<path::Path>& paths, size_t numLayers) {
+    std::vector<size_t> counts(numLayers, 0);
+    for (const auto& p : paths) {
+        for (const auto& d : p.decisions) {
+            if (d.layerIdx < numLayers)
+                counts[d.layerIdx]++;
+        }
+    }
+
+    size_t best = 0;
+    for (size_t i = 1; i < numLayers; ++i) {
+        if (counts[i] > counts[best])
+            best = i;
+    }
+
+    // Fallback compatible con occupancy si no hay decisiones contadas
+    if (counts[best] == 0 && numLayers > 1)
+        best = std::min<size_t>(1, numLayers - 1);
+
+    return best;
+}
+
 
 void codegen2::loadFromJson(const StorageAdaptor& storage) {
     // load paths
@@ -148,8 +172,13 @@ void codegen2::loadFromJson(const StorageAdaptor& storage) {
         assert(!candidates.empty());
 
 
-        // use permutation scheduler
-        QTree::PermScheduler psch(layers.at(1).numNeurons(), {firstPath}, candidates);
+        // use permutation scheduler (capa de scheduling elegida por frecuencia de decisiones)
+        std::vector<path::Path> schedPaths;
+        schedPaths.push_back(firstPath);
+        schedPaths.insert(schedPaths.end(), candidates.begin(), candidates.end());
+        const size_t schedLayerIdx = pickSchedLayerIdx(schedPaths, layers.size());
+        QTree::PermScheduler psch(layers.at(schedLayerIdx).numNeurons(), schedLayerIdx,
+                                  {firstPath}, candidates);
                 
         std::map<std::thread::id,QSim::CompilerAdaptor> compi;
         psch.run(barManager, [&](const codegen::ConstSchedule& schedule) -> double {  // FIXME

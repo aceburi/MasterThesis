@@ -19,6 +19,7 @@ namespace QTree {
 template<bool MAX = false>
 class PermScheduler final {
     const size_t numDecisions;
+    const size_t schedLayerIdx;
     const std::vector<path::Path> forced;
     const std::vector<path::Path> niceToHave;
 
@@ -38,9 +39,13 @@ class PermScheduler final {
 
         for (const auto& p : paths) {
             for (const auto& d : p.decisions) {
-                if (d.layerIdx == 1)
+                if (d.layerIdx == schedLayerIdx)
                     addIfRequired(d.neuronIdx);
             }
+
+            // occupancy asumia decisiones en capa 1; en CNN pueden estar en capa 0, etc.
+            if (toRet.empty())
+                addIfRequired(0);
 
             toRet.addPath(p);
         }
@@ -124,8 +129,10 @@ class PermScheduler final {
     }
 
 public:
-    PermScheduler(size_t numDecisions, const std::vector<path::Path>& forced, const std::vector<path::Path>& niceToHave)
-        : numDecisions(numDecisions), forced(forced), niceToHave(niceToHave) {}
+    PermScheduler(size_t numDecisions, size_t schedLayerIdx,
+                  const std::vector<path::Path>& forced, const std::vector<path::Path>& niceToHave)
+        : numDecisions(numDecisions), schedLayerIdx(schedLayerIdx),
+          forced(forced), niceToHave(niceToHave) {}
 
 
     template <typename F>
