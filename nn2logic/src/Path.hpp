@@ -308,16 +308,22 @@ struct Path final {
         return toRet;
     }
 
-    // FIXME: this needs to go
+    // Devuelve las decisiones *relevantes* (IIS): las que el solver marco como
+    // necesarias para forzar la clase const. Reune los indices (capa,neurona) de
+    // todos los subsistemas infeasibles de la hoja y filtra las decisiones a esos.
+    // Si la hoja no tiene IIS, se devuelven todas (fallback correcto).
     std::vector<Decision> iisDecisions() const {
-        throw std::runtime_error("function is obsolete");
+        std::set<std::pair<size_t,size_t>> idxs;
+        for (const auto& kv : leaf.getIIS()) {
+            const std::set<std::pair<size_t,size_t>> s =
+                static_cast<std::set<std::pair<size_t,size_t>>>(kv.second);
+            idxs.insert(s.begin(), s.end());
+        }
+        if (idxs.empty()) return decisions;
+
         std::vector<Decision> toRet;
-        /*
-        const auto iis = leaf.getIIS();
-        std::copy_if(decisions.begin(), decisions.end(), std::back_inserter(toRet), [&](const auto& d) -> bool {
-            return iis.contains(d.idx());
-        });
-        */
+        std::copy_if(decisions.begin(), decisions.end(), std::back_inserter(toRet),
+            [&](const Decision& d) -> bool { return idxs.count(d.idx()) > 0; });
         return toRet;
     }
 
