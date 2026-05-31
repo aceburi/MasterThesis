@@ -520,36 +520,37 @@ bool codegen2::HybridGenSimple::mulSortCmp(const codegen2::Instr& a, const codeg
 
 void codegen2::placeIfElse(std::vector<std::shared_ptr<codegen::c::Statement>>& code, std::shared_ptr<codegen::c::Ifelse> ifelse, const std::string& var) {
     assert(!code.empty());
-    
-    // reverse iterators and std::distance don't cut it
-    auto findLastPos = [&](auto& vis) {
-        auto it = std::prev(code.end());
-        while (it != code.begin() && !vis(*it)) {
-            it = std::prev(it);
-        }
-        return it;
-    };
-    
-    // find last assignment to var
-    codegen2::VarAssignFinder vaf(var);
-    auto it = findLastPos(vaf);
-    assert(it != code.begin());
 
-    // determine input variable that was used in this block (they are sorted)
-    auto conv = std::dynamic_pointer_cast<codegen::c::Assignment>(*it);
+    // Buscar la ultima asignacion *directa* a var (no dentro de Ifelse/RawStatement).
+    // VarAssignFinder recursivo devolvia true en un Ifelse hijo y *it no era Assignment.
+    auto found = code.end();
+    for (auto it = code.rbegin(); it != code.rend(); ++it) {
+        auto conv = std::dynamic_pointer_cast<codegen::c::Assignment>(*it);
+        if (conv && conv->getDst() == var) {
+            found = std::prev(it.base());
+            break;
+        }
+    }
+
+    if (found == code.end()) {
+        // Neurona solo con bias (sin muls en esta seccion): ReLU al final
+        code.push_back(ifelse);
+        return;
+    }
+
+    auto conv = std::dynamic_pointer_cast<codegen::c::Assignment>(*found);
     assert(conv != nullptr);
     auto arith = conv->getArith();
     auto inpVar = arith->getVar();
     assert(inpVar.has_value());
 
-    // find next position where inpVar is not used
+    auto it = std::next(found);
     codegen2::VarUseFinder vuf(inpVar.value());
     while (it != code.end() && vuf(*it)) {
         it = std::next(it);
     }
 
-    // actually insert ifelse
-    code.insert(it, ifelse);  
+    code.insert(it, ifelse);
 }
 
 
