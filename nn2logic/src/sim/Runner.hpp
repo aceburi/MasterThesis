@@ -37,7 +37,8 @@ public:
     size_t run(CompilerAdaptor& ca) const {
         // Add hybrid implementation and compile
         ca.addFile(m_srcFile.string(), m_isHybrid ? "hybrid.c" : "network.c");
-        assert(ca.compile());
+        if (!ca.compile())
+            throw std::runtime_error("RISC-V compile failed (see compilelog.txt in sim temp dir)");
 
         // execute (ruta del toolchain RISC-V configurable via NN2LOGIC_RISCV_BIN)
         const char* riscvBinEnv = std::getenv("NN2LOGIC_RISCV_BIN");

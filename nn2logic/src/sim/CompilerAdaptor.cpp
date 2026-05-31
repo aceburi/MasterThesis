@@ -1,5 +1,6 @@
 #include <sstream>
 #include <stdio.h>
+#include <sys/wait.h>
 #include "CompilerAdaptor.hpp"
 
 

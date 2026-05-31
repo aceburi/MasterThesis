@@ -59,24 +59,36 @@ public:
     void addFile(const std::filesystem::path& src, const std::string& dst = "") const;
 
     bool compile() const {
-        //auto res = executeCommand(fmt::format("/bin/bash -c 'cd \"{}\";PATH=$PATH:/opt/riscv/bin make &> compilelog.txt'", m_dir.string()));
         const char* riscvBinEnv = std::getenv("NN2LOGIC_RISCV_BIN");
         const std::string riscvBin = riscvBinEnv ? riscvBinEnv : "/opt/riscv/bin";
-        auto res = executeCommand(fmt::format("/bin/bash -c 'cd \"{}\";PATH=$PATH:{} make &> /dev/null'", m_dir.string(), riscvBin));
-        
+        const auto logPath = m_dir / "compilelog.txt";
+        auto res = executeCommand(fmt::format(
+            "/bin/bash -c 'cd \"{}\";PATH=$PATH:{} make &> \"{}\"'",
+            m_dir.string(), riscvBin, logPath.string()));
+
         if (res.status < 0)
             throw std::runtime_error(res.output);
 
+        int exitCode = 1;
+        if (WIFEXITED(res.status))
+            exitCode = WEXITSTATUS(res.status);
 
-        return res.status >= 0;
+        const auto elf = m_dir / "test.elf";
+        if (exitCode != 0 || !std::filesystem::exists(elf)) {
+            fmt::print("RISC-V compile failed (exit {}), log: {}\n", exitCode, logPath.string());
+            return false;
+        }
+
+        return true;
     }
 
 
     std::filesystem::path get() const {
         auto f = m_dir / "test.elf";
         if (!std::filesystem::exists(f)) {
-            fmt::print("tried using {} but did not exist\n", f.string());
-            assert(false);
+            const auto logPath = m_dir / "compilelog.txt";
+            throw std::runtime_error(fmt::format(
+                "test.elf missing after compile (see {})", logPath.string()));
         }
         return f;
     }

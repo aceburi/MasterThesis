@@ -20,6 +20,7 @@
 
 #include "hybrid.hpp"
 
+#include <limits>
 
 
 struct CmpDecVecs {
@@ -199,8 +200,13 @@ void codegen2::loadFromJson(const StorageAdaptor& storage) {
             }
             hg.finalize();
 
-            QSim::Runner runner(id, hg);
-            return runner.run(ca->second);
+            try {
+                QSim::Runner runner(id, hg);
+                return runner.run(ca->second);
+            } catch (const std::exception& e) {
+                fmt::print("PermScheduler sim skipped: {}\n", e.what());
+                return std::numeric_limits<double>::max();
+            }
         }, 3);  // limit to 3 paths, reduces runtime significantly
 
         score.addScore(psch.bestScore(), psch.bestSolution());
