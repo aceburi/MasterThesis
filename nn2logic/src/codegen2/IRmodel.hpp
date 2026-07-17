@@ -32,9 +32,10 @@ struct Instr {
     operator std::shared_ptr<codegen::c::Statement>() const {  // FIXME
         if (type == VARDECL) return std::make_shared<codegen::c::VarDecl>("int32_t", dst);
         if (type == ASSIGN) return std::make_shared<codegen::c::Assignment>(dst, opA);
-        if (type == MULADD) return std::make_shared<codegen::c::Assignment>(dst, codegen::c::Arith(
-            opB, codegen::c::Arith::MUL, std::stoi(opA) // FIXME: stoi is kinda ugly here 
-        ), true);
+        if (type == MULADD) {
+            return std::make_shared<codegen::c::RawStatement>(fmt::format(
+                "{} += (int64_t)({}) * (int64_t)({});\n", dst, opA, opB));
+        }
 
         if (type == SET_BIT) return std::make_shared<codegen::c::RawStatement>(fmt::format("{} |= 0b{:b};\n", dst, size_t(1) << std::stoi(opA)));
         
@@ -62,6 +63,18 @@ protected:
 
         return std::make_shared<codegen::c::Ifelse>(cmp,
             codegen::c::Block(std::make_shared<codegen::c::Assignment>(var, val))
+        );
+    }
+
+    /** ReLU: max(0, x) tras requant (SequentialCreator::processSamplesLayer). */
+    static std::shared_ptr<codegen::c::Ifelse> clampMinZero(const std::string& var) {
+        return std::make_shared<codegen::c::Ifelse>(
+            codegen::c::Comparison{
+                .variable = var,
+                .type = codegen::c::Comparison::LT,
+                .value = 0
+            },
+            codegen::c::Block(std::make_shared<codegen::c::Assignment>(var, 0))
         );
     }
 public:
@@ -92,7 +105,7 @@ public:
     std::vector<std::shared_ptr<codegen::c::Statement>> getInit() const {
         codegen::c::Container toRet;
 
-        toRet.create<codegen::c::RawStatement>(fmt::format("int32_t {} = {};\n", var(), varInit.opA));
+        toRet.create<codegen::c::RawStatement>(fmt::format("int64_t {} = {};\n", var(), varInit.opA));
 
         return toRet.get();
     }
@@ -121,7 +134,33 @@ public:
         return toRet;
     }
 
-    virtual std::shared_ptr<codegen::c::Ifelse> instantiateIfElse() const {        
+    /** Capa sin ReLU (solo la ultima): (acc * requant) >> shift, sin bifurcacion por signo. */
+    std::shared_ptr<codegen::c::Statement> requantStatement() const {
+        return std::make_shared<codegen::c::RawStatement>(
+            fmt::format("{} = (int32_t)(({} * {}) >> {});\n", var(), var(), requant.value, requant.shift));
+    }
+
+    /**
+     * Capa ReLU: requant y luego clamp [0, 127] (igual que processSamplesLayer en Python).
+     * No bifurcar por signo del acumulador pre-requant.
+     */
+    std::vector<std::shared_ptr<codegen::c::Statement>> reluPostRequantStatements() const {
+        codegen::c::Container c;
+        c.add(requantStatement());
+        c.add(saturate(var(), 127));
+        c.add(clampMinZero(var()));
+        return c.get();
+    }
+
+    /** Marca bit del arbol si el acumulador (pre-requant) es > 0 (decision del arbol nn2logic).
+     *  Sin rama: aprovecha que (acc > 0) es 0/1 -> mejor "logic flow" en CPU/RISC-V. */
+    std::shared_ptr<codegen::c::Statement> treeBitOnRawAcc(const std::string& treeVar, size_t bitPos) const {
+        return std::make_shared<codegen::c::RawStatement>(
+            fmt::format("{1} |= ((uint32_t)({0} > 0) << {2});\n", var(), treeVar, bitPos),
+            false);
+    }
+
+    virtual std::shared_ptr<codegen::c::Ifelse> instantiateIfElse() const {
         /*
          if > 0
            mul and shift
@@ -135,11 +174,11 @@ public:
          */
 
         auto blockPos = codegen::c::Block{};
-        blockPos.create<codegen::c::RawStatement>(fmt::format("{} = ({} * {}) >> {};\n", var(), var(), requant.value, requant.shift));
+        blockPos.create<codegen::c::RawStatement>(fmt::format("{} = (int32_t)(({} * {}) >> {});\n", var(), var(), requant.value, requant.shift));
         blockPos.add(saturate(var(), 127));
 
         auto blockNeg = codegen::c::Block{};
-        blockNeg.create<codegen::c::RawStatement>(fmt::format("{} = ~((~({} * {})) >> {});\n", var(), var(), requant.value, requant.shift));
+        blockNeg.create<codegen::c::RawStatement>(fmt::format("{} = (int32_t)(~((~({} * {})) >> {}));\n", var(), var(), requant.value, requant.shift));
         blockNeg.add(saturate(var(), -127));
 
         auto ifelse = std::make_shared<codegen::c::Ifelse>(
@@ -174,9 +213,13 @@ public:
         blockElse.push_back(a);
     }
 
+    [[nodiscard]] bool hasPathDeferredMuls() const {
+        return !blockIf.empty() || !blockElse.empty();
+    }
+
     std::shared_ptr<codegen::c::Ifelse> instantiateIfElse() const override {
         auto blockPos = codegen::c::Block{};
-        blockPos.create<codegen::c::RawStatement>(fmt::format("{} = ({} * {}) >> {};\n", var(), var(), requant.value, requant.shift));
+        blockPos.create<codegen::c::RawStatement>(fmt::format("{} = (int32_t)(({} * {}) >> {});\n", var(), var(), requant.value, requant.shift));
         blockPos.add(saturate(var(), 127));
         blockPos.add(convInstr(blockIf));
 
