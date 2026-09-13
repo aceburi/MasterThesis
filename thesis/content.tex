@@ -1,0 +1,1288 @@
+%*****************************************
+\chapter{Introduction}
+\label{ch:introduction}
+%*****************************************
+\hint{This chapter should motivate the thesis and describe the major contributions. Detailed problem formulation and research questions appear in the evaluation chapter.}
+
+\section{Motivation}
+\label{sec:motivation}
+
+Machine learning is increasingly deployed next to the sensor rather than in a remote data centre.
+Always-on occupancy monitoring in buildings, activity recognition from wearable inertial units, and screening of medical images at the point of care all require a classifier to run locally, often within milliseconds and on a battery budget.
+Offloading raw sensor data to the cloud is frequently unacceptable: the radio can dominate energy consumption, connectivity cannot be assumed, latency becomes unpredictable, and the payload may be privacy-sensitive.
+The resulting design point is known as tiny machine learning (\emph{TinyML}): inference on \acp{MCU} with tens to a few hundred kilobytes of \ac{SRAM}, limited Flash, clock rates from tens of megahertz on the smallest parts to well above \(100\,\mathrm{MHz}\) on higher-performance chips such as the ESP32, and power in the milliwatt range~\cite{banbury2021mlperftiny,lin2020mcunet}.
+On these devices the execution engine is a general-purpose \ac{CPU}---increasingly a small open \mbox{RISC-V} core such as Ibex~\cite{lowriscibex}---not a \ac{GPU} and usually not a dedicated neural accelerator.
+
+\Acp{CNN} are the default model family for the visual and short time-series tasks that dominate this setting.
+Even a compact \ac{CNN} spends the large majority of its arithmetic in sliding-window \ac{MAC} operations.
+The TinyML literature has therefore concentrated on making those \acp{MAC} cheaper and fewer: integer quantization and \ac{QAT}~\cite{jacob2018quantization,sun2023classquant}, pruning and compression~\cite{han2015deepcompression}, microcontroller-specialised neural architecture search~\cite{lin2020mcunet}, and kernels and compilers that schedule loops, tiles, and memory more carefully~\cite{lai2018cmsisnn,david2021tflite}.
+These methods explain why networks of a few thousand operations can run on a small \ac{MCU} at all.
+They do not, however, change the \emph{kind} of computation being performed: the network is still evaluated as a dense arithmetic graph in which every sample pays for essentially the same sequence of multiplications.
+That is a poor match for the hardware.
+Typical microcontroller cores devote most of their area to control flow and integer logic, provide only a few hardware multipliers, and lack the wide SIMD units found on application processors~\cite{stein2026nn2logic}.
+Executing thousands of \acp{MAC} on such a core is feasible, but it is not what the microarchitecture is optimised for.
+
+A second consideration is that not every input is equally difficult.
+Some samples admit a confident decision after only part of the network has been evaluated.
+Dynamic and early-exit architectures exploit this by attaching auxiliary classifiers to intermediate layers and skipping the remainder of the graph when a sample appears easy~\cite{teerapittayanon2016branchynet,guo2025dynamic,wang2024earlyexit}.
+The computation that is skipped is still, for the most part, ordinary neural arithmetic: fewer \acp{MAC}, but still \acp{MAC}.
+For networks whose activations are piecewise linear---\ac{ReLU} being the usual choice---there is a stronger structural fact.
+Such a network partitions its input space into regions on which the mapping is affine and is therefore \emph{exactly} equivalent to a decision tree~\cite{aytekin2022nns}.
+The tree is not a surrogate trained to imitate the network; under the stated assumptions it computes the same function.
+
+From a hardware perspective, a path through that tree is a short program of integer comparisons and a reduced set of \acp{MAC}, which is closer to the mix of operations a \ac{CPU} handles efficiently than a uniform stack of layers.
+The representation is not free.
+The full tree can be far larger than the original network, building and certifying it is expensive, exploration is limited to branches seen on the training set, and any hybrid that embeds only a subset of paths still charges dispatcher overhead on samples that eventually run the fallback network.
+
+The NN2Logic framework, developed at TU~Darmstadt, operationalises this idea for quantised networks~\cite{stein2026nn2logic}.
+A model is converted into a decision tree over training data; paths that end in a provably constant class are compressed into \emph{logic flow} and emitted as bare-metal C; samples that match none of the embedded paths fall back to the original integer network.
+On a simulated Ibex \mbox{RISC-V} core, this hybrid execution reduced average latency by up to \(14.9\,\%\) on a room-occupancy fully connected classifier with no loss of accuracy, but only \(0.7\,\%\) on a fully connected even/odd MNIST model~\cite{deng2012mnist,stein2026nn2logic}.
+The same publication identifies convolutional and multi-class networks as the next step.
+
+That result defines the starting point of this thesis.
+TinyML vision and sensing rely on convolutional models, not on the small fully connected networks with which NN2Logic was demonstrated.
+In a tiny \ac{CNN}, most of the \ac{MAC} budget sits in the first feature-extraction stage, so skipping a lightweight classifier head after a full convolution saves little arithmetic.
+At the same time, the code that implements a convolution can dominate Flash when every spatial position is emitted separately.
+A hybrid that improves average cycle count on some samples can therefore still fail as a deployable solution once fallback overhead and code size are included.
+
+This thesis investigates whether the logic-flow approach can be carried over to such networks on a microcontroller-class \mbox{RISC-V} processor.
+The aim is not a single headline speed-up figure, but a characterisation of when the hybrid remains a net win---for samples that exit early, for samples that do not, and for the Flash budget of a real \ac{MCU}.
+The technical means by which convolutional models are encoded, how routes are chosen, and how code is emitted are developed in the design and implementation chapters; their effect is measured in the evaluation chapter.
+
+\section{Contributions}
+\label{sec:contributions}
+
+This thesis extends the NN2Logic hybrid approach from fully connected baselines to tiny quantised \acp{CNN} for TinyML classification.
+The work stays within the TinyML scale---networks with a few thousand \acp{MAC}, not server-class models---and evaluates generated bare-metal C on a simulated Ibex \mbox{RISC-V} core, using cycle counts and object-file size as proxies for latency and Flash occupancy.
+
+The main contributions are:
+\begin{enumerate}
+	\item \textbf{A CNN-capable conversion and hybrid-generation pipeline.}
+	\label{contrib:pipeline}
+	An end-to-end workflow from quantised \ac{CNN} training through integer network export, decision-tree construction, route selection, and hybrid C emission, building on NN2Logic rather than replacing it.
+
+	\item \textbf{Hybrid strategies for convolution-dominated networks.}
+	\label{contrib:hybrid}
+	Path selection and code generation adapted to the cost profile of tiny \acp{CNN}: scoring routes by net cycle savings, preferring early exits before the linear head where the feature map has already been computed, and evaluating only the input region required for a candidate route.
+
+	\item \textbf{Code-size-aware convolution emission.}
+	\label{contrib:codesize}
+	A split between unrolled arithmetic on the neurons that guard early exits and looped kernels for the remaining feature map, together with joint reporting of cycles and generated code size---a dimension largely absent from the original NN2Logic evaluation~\cite{stein2026nn2logic}.
+\end{enumerate}
+
+Each hybrid binary is compared against a reference implementation generated from the same quantised network and compiled with the same toolchain, so that measured differences are attributable to logic-flow execution rather than to an unrelated compiler stack.
+
+\section{Outline}
+\label{sec:outline}
+
+After the background in Chapter~\ref{ch:background} and a survey of related work in Chapter~\ref{ch:relatedwork}, Chapter~\ref{ch:design} presents the proposed pipeline at conceptual level and Chapter~\ref{ch:implementation} describes how it is realised.
+Chapter~\ref{ch:evaluation} defines the evaluation goals, introduces the workloads and network topologies under test, states the research questions, and reports measurements.
+Chapter~\ref{ch:closure} summarises the findings and outlines future work.
+
+
+
+%*****************************************
+\chapter{Background}
+\label{ch:background}
+%*****************************************
+\hint{This chapter should give a comprehensive overview on the background necessary to understand the thesis.}
+
+The following sections introduce the TinyML constraints that motivate this work, the integer quantisation and \ac{CNN} encoding used in the pipeline, the decision-tree view of piecewise-linear networks, the \mbox{RISC-V} evaluation platform, and the baseline NN2Logic framework that the thesis extends.
+Prior work on TinyML runtimes, compression, and conditional inference is surveyed separately in Chapter~\ref{ch:relatedwork}.
+
+
+\section{TinyML and Resource-Constrained Inference}
+\label{sec:bg-tinyml}
+
+Tiny machine learning denotes neural-network inference on devices whose compute, memory, and energy budgets are orders of magnitude smaller than those of mobile phones or servers~\cite{banbury2021mlperftiny,lin2020mcunet}.
+Typical targets are \acp{MCU}: single-chip systems built around a general-purpose \ac{CPU}, with on the order of \(10^2\)~kB of \ac{SRAM}, a few megabytes of Flash, clock rates from tens of megahertz to well above \(100\,\mathrm{MHz}\) on higher-performance parts, and no \ac{GPU}.
+MLPerf~Tiny standardises accuracy, latency, and energy on such devices using model footprints below one megabyte~\cite{banbury2021mlperftiny}.
+Many such devices run without a full operating system or with only a minimal runtime, which favours statically linked, bare-metal executables over interpreter-based stacks.
+
+Applications are diverse but share the same constraints.
+Always-on keyword spotting and visual wake-word detection must meet strict latency bounds on every invocation.
+Human-activity recognition from inertial sensors must run continuously on a coin-cell budget.
+Room-occupancy inference from environmental sensors and low-resolution medical screening must preserve privacy by keeping raw data on the device~\cite{banbury2021mlperftiny}.
+Industry benchmarks such as MLPerf~Tiny report accuracy, latency, and energy together because any one metric alone is misleading on an \ac{MCU}~\cite{banbury2021mlperftiny}.
+
+Three resource limits recur across these applications.
+\textbf{Latency} must be predictable: an always-on classifier that occasionally misses its deadline is unreliable regardless of average throughput.
+\textbf{Memory} is tight in two places: \ac{SRAM} bounds activations and scratch buffers during inference, while Flash bounds the stored weights and the compiled program.
+\textbf{Energy} is dominated by memory traffic and integer arithmetic on a core that typically provides only a few hardware multipliers and no wide SIMD~\cite{stein2026nn2logic}.
+
+Chapter~\ref{ch:relatedwork} reviews how the TinyML literature reduces the cost of conventional neural inference---through quantisation, kernel libraries, co-designed architectures, and embedded runtimes---while keeping a largely static layer graph.
+This thesis instead generates bare-metal C for a \ac{CPU}-centric \mbox{RISC-V} core without an interpreter or vendor-specific kernel stack, so that measured cycle and code-size differences isolate hybrid control flow (Section~\ref{sec:bg-riscv}).
+The quantised networks, linearisation scheme, and baseline NN2Logic pipeline used here are introduced in the sections that follow.
+
+
+\section{Quantization and Quantization-Aware Training}
+\label{sec:bg-quant}
+
+Neural networks are ordinarily trained and stored in floating point.
+On an \ac{MCU}, floating-point hardware is often absent or slow, and 32-bit parameters consume Flash that could otherwise hold application logic.
+\textbf{Quantisation} maps real-valued weights and activations to low-bit integers---typically eight bits---so that inference reduces to integer \acp{MAC} with per-tensor or per-channel scale factors~\cite{jacob2018quantization}.
+
+In the affine scheme used throughout this work, a quantised value \(x\) approximates \(\hat{x} \approx s_x(x - z_x)\) with scale \(s_x\) and zero-point \(z_x\).
+For a linear layer with quantised weights \(w\),
+\[
+  y = \mathrm{round}\!\left(\frac{s_w s_x}{s_y}\, w^\top x + b_\mathrm{int}\right),
+\]
+where the integer bias \(b_\mathrm{int}\) absorbs the floating-point offset during conversion.
+Each hidden unit then applies an activation function before rescaling for the next layer.
+The networks studied here use \ac{ReLU}, which zeroes negative pre-activations.
+That choice matters for the tree-based view in Section~\ref{sec:bg-trees}: each \ac{ReLU} introduces a binary decision on the sign of a pre-activation.
+
+\textbf{Post-training quantisation} calibrates scales on representative data after floating-point training.
+\textbf{Quantization-aware training} (\ac{QAT}) simulates quantisation during training so that the network learns to tolerate rounding error~\cite{jacob2018quantization}.
+In this thesis, models are trained in floating point, calibrated, and then frozen to fixed integer weights and scales before export.
+Uniform 8-bit quantisation is used throughout for compatibility with NN2Logic's integer network format.
+
+Export yields three artefacts used downstream.
+Integer weights and biases for every layer; fixed-point scale metadata that governs rescaling between layers; and a collection of integer input samples from the training split, used both to verify the quantised forward pass and to bound decision-tree exploration.
+If quantisation degrades accuracy substantially relative to the floating-point model, later tree optimisation cannot recover it.
+\ac{QAT} is therefore a prerequisite for the pipeline, not an optional compression step.
+
+
+\section{Tiny Convolutional Neural Networks}
+\label{sec:bg-cnn}
+
+The classification tasks in this thesis---handwritten-digit parity, clothing discrimination, chest-radiograph screening, inertial activity recognition, and related TinyML benchmarks---are addressed with deliberately small \acp{CNN}.
+A typical topology contains one or two convolutional stages followed by one or two fully connected layers, with on the order of \(10^3\)--\(10^4\) \acp{MAC} in total.
+That scale is chosen to match \ac{MCU} deployment rather than to compete with server-side accuracy.
+
+A representative block, reused with minor variations across datasets, is shown in Figure~\ref{fig:tiny-cnn-topology}.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.92\textwidth]{figures/TinyCNN}
+	\caption{Typical tiny \ac{CNN} block used in this thesis: convolution, normalisation, pooling, \ac{ReLU}, and two fully connected stages.}
+	\label{fig:tiny-cnn-topology}
+\end{figure}
+
+Batch normalisation is fused into the preceding convolution or linear layer at export, so the integer network contains only piecewise-linear operators.
+Average pooling is expressed as a fixed linear map over each window, with a rational scale factor.
+Dropout is disabled at inference.
+
+\paragraph{Encoding convolution for tree construction.}
+NN2Logic consumes an ordered list of integer linear layers separated by activation gates; it has no native spatial operators.
+A two-dimensional convolution is therefore converted to an equivalent dense matrix by unfolding the input patch addressed at each output position~\cite{jacob2018quantization}.
+Pooling can be folded into the same matrix when the geometry allows.
+The result is exact for a fixed input resolution: each matrix row corresponds to one scalar activation at one spatial location, and a tree decision on that row is a predicate on a specific receptive field of the input.
+
+This representation is appropriate for equivalence checking and tree exploration, not for efficient conventional inference.
+The unfolded matrix is structurally sparse but stored densely, and its row count grows with the output map size.
+It nonetheless preserves the neuron indexing that certification and code generation rely on.
+
+\paragraph{Asymmetric layer costs.}
+In a tiny \ac{CNN} the arithmetic profile is structurally skewed.
+The first feature-extraction stage must touch every spatial position in the input map: after linearisation, each output cell becomes its own row in an unfolded matrix, and every row performs a multiply--accumulate over an entire receptive field.
+The classifier head, by contrast, operates on a comparatively low-dimensional feature vector with only a handful of hidden units.
+Most integer muladds therefore accumulate in the first stage even when the decision tree branches mainly on neurons in the later linear layers.
+
+This asymmetry limits a naive reading of early-exit benefits.
+A route that certifies the class after predicates on the head still leaves the dominant convolutional cost unpaid unless the exit fires earlier in the unfolded stage.
+That situation differs from the fully connected occupancy models on which NN2Logic reported its largest latency gains, where hidden layers are similar in width and an exit after a few sign tests can skip a substantial share of the network (Section~\ref{sec:bg-nn2logic}).
+Table~\ref{tab:mac-breakdown} illustrates the effect on the quantised workloads evaluated in this thesis: the first linearised stage typically absorbs roughly four fifths or more of all muladds, while the two-layer head contributes only a few hundred operations in total.
+Whether exits placed before the head can recover enough of that front-end cost to offset dispatcher and code-size overhead is an empirical question addressed in Chapter~\ref{ch:evaluation}.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Share of integer muladds in the linearised export used for tree construction on the TinyML workloads evaluated in this thesis.
+		Counts are non-zero multiply--accumulate operations in a full forward pass on the quantised network, not dense theoretical convolutions over zero-valued input pixels.
+		Fashion-MNIST and PneumoniaMNIST share the same single-filter \(14{\times}14\) topology but differ in input data.}
+	\label{tab:mac-breakdown}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.26\textwidth}rr>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+		\toprule
+		\textbf{Task} & \textbf{Input} & \textbf{Total} & \textbf{First stage} & \textbf{FC head} \\
+		\midrule
+		MNIST even/odd & $28{\times}28$ & 2313 & 2116 (\(\approx 91.5\,\%\)) & 197 (\(\approx 8.5\,\%\)) \\
+		Fashion-MNIST (binary) & $14{\times}14$ & 879 & 676 (\(\approx 76.9\,\%\)) & 203 (\(\approx 23.1\,\%\)) \\
+		PneumoniaMNIST & $14{\times}14$ & 879 & 676 (\(\approx 76.9\,\%\)) & 203 (\(\approx 23.1\,\%\)) \\
+		HAR (3-class) & $128{\times}9$ & 1938 & 1820 (\(\approx 93.9\,\%\)) & 118 (\(\approx 6.1\,\%\)) \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+
+\section{Neural Networks as Decision Trees}
+\label{sec:bg-trees}
+
+A feed-forward network whose hidden units apply piecewise-linear activations partitions its input space into a finite set of convex regions.
+Within each region the network is affine; crossing a region boundary flips the activation pattern of at least one unit~\cite{aytekin2022nns}.
+Aytekin showed that such a network can be represented \emph{exactly} as a decision tree whose internal nodes test the sign of pre-activations and whose leaves return the network output on the corresponding region~\cite{aytekin2022nns}.
+The tree is not an approximate surrogate; under the stated assumptions it implements the same input--output mapping as the original network.
+
+For classification, a leaf is \emph{constant} when one class is guaranteed for every input that satisfies the decisions on the path to that leaf.
+Training samples alone are insufficient evidence: two inputs may agree on all explored decisions yet differ in class.
+NN2Logic therefore encodes each candidate leaf as a feasibility problem over the input domain and asks whether any input consistent with the path can change the predicted class.
+Mixed-integer programming is used for this certification step, as described in Section~\ref{sec:bg-nn2logic}.
+
+The tree view suggests two execution opportunities.
+A path to a constant leaf is a conjunction of integer predicates; when it fires, the remaining layers need not run.
+Furthermore, only a subset of the predicates on that path may be necessary to certify the leaf, so emitted code can omit redundant tests.
+Section~\ref{sec:bg-nn2logic} describes how NN2Logic turns certified paths into executable \emph{logic flows} and wraps them in a hybrid dispatcher, using Stein \textit{et al.}'s published running example~\cite{stein2026nn2logic}.
+
+
+\section{RISC-V Microcontrollers and Cycle-Level Evaluation}
+\label{sec:bg-riscv}
+
+Evaluating a bare-metal inference program on an \ac{MCU} without a full operating system rules out timing through a high-level framework.
+NN2Logic instead generates C sources, cross-compiles them for a 32-bit \mbox{RISC-V} core, and runs the resulting binary in the Spike instruction-set simulator~\cite{stein2026nn2logic,lowriscibex}.
+Spike models architectural execution cycle by cycle.
+The configuration used in this thesis targets the Ibex core with the integer multiply extension, a representative open \mbox{RISC-V} microcontroller-class \ac{CPU}.
+
+\paragraph{Reference and hybrid binaries.}
+For each quantised network, two programs are built from the same integer weights and the same neuron ordering.
+The \textbf{reference} program evaluates the network layer by layer with no early exits.
+The \textbf{hybrid} program prepends a dispatcher that attempts a set of logic-flow routes and executes the reference body only when no route matches.
+Both programs share the toolchain, linker script, and bare-metal runtime.
+Latency is measured from the architectural cycle counter; correctness is checked by comparing simulator output against held-out labels.
+
+This paired setup isolates the effect of hybrid control flow.
+Any cycle difference between the two programs on the same input arises from the embedded routes and their dispatcher, not from a change of compiler or operator ordering.
+
+\paragraph{Metrics and limitations.}
+The evaluation reports accuracy, per-sample cycle counts (minimum, mean, and maximum where relevant), the fraction of test inputs that exit through a logic-flow route, and the size of the compiled object code as a proxy for Flash occupancy.
+Instruction-level simulation is reproducible and makes it practical to sweep full test sets on a workstation.
+It does not model cache effects, Flash wait states, or peripheral activity on a specific silicon part; absolute cycle figures should be interpreted comparatively between reference and hybrid, not as guarantees for a particular chip.
+
+
+\section{The NN2Logic Framework}
+\label{sec:bg-nn2logic}
+
+NN2Logic is an open-source framework developed at TU~Darmstadt that implements the conversion pipeline described by Stein \textit{et al.}~\cite{stein2026nn2logic}.
+The thesis extends its export path, route selection, and code generation for convolutional models; the baseline behaviour summarised here follows the published description and running example.
+
+\paragraph{Pipeline passes.}
+The framework proceeds in four stages~\cite{stein2026nn2logic}.
+\textbf{Packaging} combines a quantised network, input-encoding metadata, and integer training samples into a single interchange format.
+\textbf{Tree exploration} walks the network in fixed layer order, maps each \ac{ReLU} to a decision node, and retains only branches that at least one training sample traverses.
+\textbf{Leaf certification} tests which leaves predict a single class for all inputs consistent with their path, using mixed-integer programming; for each certified leaf the solver returns an \textbf{irreducible infeasible subsystem} (\ac{IIS}), the minimal set of \ac{ReLU} decisions that already proves the class~\cite{stein2026nn2logic}.
+\textbf{Hybrid emission} selects a subset of certified paths, compresses each to its \ac{IIS}, and generates C code that evaluates those logic flows before falling back to the full integer network.
+
+\paragraph{Illustrative network.}
+Stein \textit{et al.}\ introduce the pipeline on a toy binary classifier over two normalised inputs \(x_0, x_1 \in [0,1]\)~\cite{stein2026nn2logic}.
+Three hidden units apply piecewise-linear \ac{ReLU} gates,
+\[
+  y_0 = \mathrm{ReLU}(2x_0 - 1),\quad
+  y_1 = \mathrm{ReLU}(3x_1 - 2),\quad
+  y_2 = \mathrm{ReLU}(6x_0 + 6x_1 - 7),
+\]
+and two output scores combine hidden activations linearly, \(y_3 = y_0 + y_1\) and \(y_4 = y_1 + y_2\), before argmax selects class \(c_0\) or \(c_1\).
+Figure~\ref{fig:stein-toy-network} shows the connectivity: each \ac{ReLU} introduces a binary region boundary, so the network partitions the unit square into finitely many convex cells on which the mapping is affine~\cite{aytekin2022nns,stein2026nn2logic}.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.72\textwidth]{figures/stein_toy_network.png}
+	\caption{Toy quantised network from Stein \textit{et al.}~\cite{stein2026nn2logic}: two inputs, three \ac{ReLU} hidden units, and a two-way linear head.
+		Each hidden node corresponds to a sign test on a pre-activation; the head aggregates active units into class scores.}
+	\label{fig:stein-toy-network}
+\end{figure}
+
+\paragraph{From decision tree to hybrid program.}
+Tree exploration instantiates the equivalence of Section~\ref{sec:bg-trees} on the toy network: internal nodes test whether a pre-activation is positive, and each root-to-leaf path fixes a pattern of active and inactive \ac{ReLU} units~\cite{stein2026nn2logic}.
+Leaf certification then asks whether the class is fixed on that pattern.
+Some leaves admit a direct class decision from a short comparison of output scores; others are marked invalid because no training sample or no consistent input region supports them.
+For each certified leaf the solver returns an \ac{IIS}---the smallest set of sign decisions that already implies the class---so the emitted code need not re-evaluate every neuron on the original path~\cite{stein2026nn2logic}.
+
+Hybrid emission embeds a subset of these certified routes as \emph{logic flows} ahead of the original network body~\cite{stein2026nn2logic}.
+Figure~\ref{fig:stein-hybrid-flow} pairs the explored tree with the generated C structure.
+Diamond nodes are predicates on pre-activations (for example \(2x_0 - 1 > 0\)); rectangular leaves show either a constant class or a hand-written comparison of output scores.
+Leaves annotated with an \ac{IIS} compress the path to a conjunction of sign tests; the highlighted leaf~\(L_4\) illustrates a sample that \emph{does not} early-exit: its \ac{IIS} still requires partial evaluation of the hidden layers, so execution continues into the neural fallback block marked \texttt{// continue as a NN}.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\textwidth]{figures/stein_hybrid_flow.png}
+	\caption{Decision tree and hybrid C structure for the toy network~\cite{stein2026nn2logic}.
+		Left: explored tree with true/false branches, certified leaves \(L_0\)--\(L_4\), and \ac{IIS} annotations (dotted paths are absent from training or uncertified).
+		Right: generated logic-flow dispatcher with an early return on a certified prefix and a fallback body that completes the integer forward pass when no embedded route matches.}
+	\label{fig:stein-hybrid-flow}
+\end{figure}
+
+At runtime the hybrid program therefore follows a two-phase flow~\cite{stein2026nn2logic}.
+\textbf{Phase~1 (logic flow).}
+The dispatcher evaluates shared predicates in a fixed order, updating a compact route identifier as each test succeeds.
+When the identifier matches a certified leaf, the program returns the proved class immediately without executing the remaining layers.
+\textbf{Phase~2 (neural fallback).}
+If no embedded route matches, control transfers to the reference forward pass---the same integer arithmetic as a non-hybrid binary---so accuracy is bounded by the quantised network whenever the fallback runs.
+Every embedded route adds predicate work that \emph{all} inputs may pay before Phase~2 begins, including inputs that eventually need the fallback; this dispatcher overhead is independent of whether the sample is easy or hard~\cite{stein2026nn2logic}.
+
+\paragraph{Tree exploration in more detail.}
+Exploration is parallelised and bounded by a memory budget~\cite{stein2026nn2logic}.
+For large training-sample limits the explored tree can occupy hundreds of megabytes of RAM, so practical runs trade sample coverage against a cap on resident state.
+The result is a catalogue of root-to-leaf paths, each annotated with the layer, neuron, and branch direction of every decision along the way.
+Paths that the training set never reaches are absent from the catalogue.
+
+\paragraph{Certification and compression.}
+A leaf is useful for hybrid emission only if it is constant: one class must be provably correct for every input satisfying the path decisions~\cite{stein2026nn2logic}.
+For each competing class, the framework asks whether an admissible input exists that follows the path yet flips the outcome.
+Infeasibility for all alternatives certifies the leaf.
+The accompanying \ac{IIS} identifies which pre-activations must be evaluated to recognise the path; logic-flow code need compute and test only those neurons.
+
+Not every leaf certifies.
+A binary task may admit constant leaves for one class only; a multi-class head may require decisions deep in the linear layers before a class is fixed.
+The layer at which constant leaves appear, and the classes they cover, depend on the network and data and are not assumed a priori~\cite{stein2026nn2logic}.
+
+\paragraph{Published results on fully connected models.}
+Stein \textit{et al.}\ applied this pipeline to three small fully connected classifiers~\cite{stein2026nn2logic}.
+The room-occupancy model is a three-layer perceptron over 22 sensor inputs (22\(\rightarrow\)10\(\rightarrow\)25\(\rightarrow\)2); its layers contribute comparable muladd counts, so an early exit after a few predicates can skip a substantial fraction of the network.
+On simulated Ibex, average latency fell by up to \(14.9\,\%\) on two room-occupancy variants without accuracy loss, but only \(0.7\,\%\) on a binarised MNIST even/odd task~\cite{deng2012mnist,stein2026nn2logic}.
+The latter network is fully connected as well, yet its layer costs are already skewed relative to the occupancy baseline; the convolution-dominated models in Table~\ref{tab:mac-breakdown} skew them further.
+Stein \textit{et al.}\ report cycle counts but not generated code size, and identify convolutional and multi-class networks as explicit future work~\cite{stein2026nn2logic}.
+
+
+\section{Summary}
+\label{sec:bg-summary}
+
+TinyML inference on \acp{MCU} is constrained by \ac{SRAM}, Flash, and the integer-centric microarchitecture of small \acp{CPU} (Section~\ref{sec:bg-tinyml}).
+Integer \ac{QAT} supplies the fixed-point models exported into NN2Logic (Section~\ref{sec:bg-quant}).
+Tiny \acp{CNN} are linearised for tree construction; Table~\ref{tab:mac-breakdown} quantifies their convolution-dominated muladd profile (Section~\ref{sec:bg-cnn}).
+Piecewise-linear networks admit an exact decision-tree representation (Section~\ref{sec:bg-trees}); Section~\ref{sec:bg-nn2logic} documents the baseline hybrid pipeline and published Ibex results that this thesis extends.
+Evaluation uses paired reference and hybrid bare-metal programs on simulated Ibex (Section~\ref{sec:bg-riscv}).
+How this approach compares to other TinyML optimisation lines is analysed in Chapter~\ref{ch:relatedwork}.
+Extensions for convolutional export, route selection, and code generation are presented in Chapters~\ref{ch:design} and~\ref{ch:implementation}; their effect is measured in Chapter~\ref{ch:evaluation}.
+
+
+%*****************************************
+\chapter{Related Work}
+\label{ch:relatedwork}
+%*****************************************
+\hint{This chapter should give a comprehensive overview on the related work done by other authors followed by an analysis why the existing related work is not capable of solving the problem described in the introduction.}
+
+Chapter~\ref{ch:background} established the technical foundations used in this thesis: TinyML constraints, integer quantisation, \ac{CNN} linearisation, the decision-tree view, the NN2Logic baseline pipeline, and the Ibex evaluation setup.
+This chapter surveys prior work on TinyML inference and analyses how those lines of research relate to the extensions developed here.
+Section~\ref{sec:rw-tinyml} covers microcontroller runtimes and kernel optimisation.
+Section~\ref{sec:rw-compression} reviews quantisation and compression.
+Section~\ref{sec:rw-earlyexit} discusses dynamic and early-exit inference.
+Section~\ref{sec:rw-trees} positions NN2Logic against the broader tree-equivalence literature.
+Section~\ref{sec:rw-analysis} states the remaining gaps that motivate this thesis.
+
+
+\section{Microcontroller Inference Runtimes and Kernels}
+\label{sec:rw-tinyml}
+
+The latency, memory, and energy limits of TinyML deployment are summarised in Section~\ref{sec:bg-tinyml}.
+Within those constraints, deploying neural networks on \acp{MCU} has produced a specialised software stack distinct from mobile or server frameworks.
+Interpreter-based runtimes such as TensorFlow Lite Micro target severely memory-constrained devices by avoiding dynamic allocation, serialising models in a compact flat-buffer format, and executing operators through a minimal interpreter loop~\cite{david2021tflite}.
+Hand-written kernel libraries such as CMSIS-NN pursue the same goal from the opposite direction: highly tuned C implementations of convolutions and matrix multiplications for Arm Cortex-M \acp{CPU}, with loop unrolling and fixed-point arithmetic chosen to minimise cycles per operator~\cite{lai2018cmsisnn}.
+
+Both approaches assume that inference remains a \emph{layer graph}: operators are scheduled in a fixed order, and optimisation effort goes into making each operator faster or smaller.
+Memory planning, operator fusion, and static buffer assignment reduce overhead, but the control structure of inference does not change.
+Every input still visits the same sequence of kernels unless the framework applies optimisations that are invisible at the application level.
+
+A complementary direction co-designs the network architecture with the inference engine.
+MCUNet jointly searches for a small model and a matching runtime schedule so that ImageNet-scale accuracy becomes feasible on commercial \acp{MCU}; the co-designed system fits within \(320\,\mathrm{kB}\) of peak \ac{SRAM} on a representative device~\cite{lin2020mcunet}.
+The search optimises for peak \ac{SRAM} usage and operator cost under a given engine, not for input-dependent control flow.
+Industry benchmarks such as MLPerf~Tiny standardise accuracy, latency, and energy measurement for this class of system, reinforcing the layer-graph execution model as the default point of comparison~\cite{banbury2021mlperftiny}.
+
+These contributions establish what efficient \ac{MAC}-oriented inference on an \ac{MCU} can achieve.
+They do not extract input-dependent branches from a fixed quantised network, nor do they emit bare-metal logic-flow code ahead of a neural fallback.
+That limitation motivates the logic-flow line of work reviewed in Section~\ref{sec:rw-trees}, which targets \ac{CPU} strengths rather than only cheaper convolutions.
+
+
+\section{Model Compression and Quantisation}
+\label{sec:rw-compression}
+
+Reducing model size and arithmetic cost is a prerequisite for TinyML, independent of how inference is scheduled.
+\textbf{Pruning} removes weights or entire structures whose contribution to accuracy is small~\cite{han2015deepcompression}.
+\textbf{Quantisation} maps weights and activations to low bit-width integers so that inference uses fixed-point \acp{MAC} instead of floating-point operations~\cite{jacob2018quantization}.
+\textbf{Distillation} and architecture search further shrink models by training smaller students or searching over compact topologies~\cite{lin2020mcunet,han2015deepcompression}.
+Finer-grained quantisation schemes assign different precisions to individual filters based on their importance to each output class~\cite{sun2023classquant}.
+
+All of these methods address the \emph{volume} of neural arithmetic.
+A pruned, quantised network is still evaluated as a neural network: layers, weight tensors, and activation functions wired in a static graph.
+None of them rewrites inference as a hybrid of certified predicates and a fallback body.
+Quantisation is nonetheless a necessary precursor for the approach in this thesis, because the decision-tree equivalence exploited by NN2Logic is defined over piecewise-linear integer networks rather than over floating-point graphs.
+The affine quantisation scheme and export format used here are specified in Section~\ref{sec:bg-quant}.
+
+
+\section{Dynamic and Early-Exit Inference}
+\label{sec:rw-earlyexit}
+
+A second family of techniques reduces average inference cost by \emph{skipping} computation for inputs that appear easy.
+\textbf{Early-exit} architectures attach auxiliary classifiers to intermediate layers and halt processing when a confidence threshold is met~\cite{teerapittayanon2016branchynet}.
+The skipped layers are ordinary neural blocks; only the depth of execution changes.
+More recent schemes refine the idea by excluding classes at intermediate layers so that later stages operate on a reduced label set~\cite{wang2024earlyexit}.
+Surveys of dynamic network structures cover a broader design space, including variable depth, width, and routing learned during training~\cite{guo2025dynamic}.
+
+These methods share two properties relevant to the present work.
+First, the early-exit decision is \emph{learned} or \emph{thresholded} at runtime rather than derived as a certificate from the exact structure of a fixed quantised network.
+Second, the computation that remains when an exit fires is still dominated by standard layer execution up to the exit point.
+For a \ac{CNN}, that typically means the full convolutional front end has already run before any auxiliary head can fire.
+
+Logic-flow hybrids differ in both respects; the hybrid execution model used here is defined in Section~\ref{sec:bg-nn2logic}.
+Routes are extracted from an \emph{existing} quantised model by tree exploration and mixed-integer certification, not by training additional exit heads.
+An exit, when it fires, follows a compressed predicate sequence that may omit entire layers rather than merely stopping after them.
+The trade-off is build-time complexity and dispatcher overhead, which early-exit networks handle differently through runtime thresholds.
+
+
+\section{Decision Trees and Logic-Flow Conversions}
+\label{sec:rw-trees}
+
+Aytekin showed that piecewise-linear networks are exactly equivalent to decision trees~\cite{aytekin2022nns}.
+That result is exact but conceptual: it does not specify how to explore, certify, or compile trees under TinyML resource limits, nor how to execute them efficiently on an \ac{MCU}.
+
+NN2Logic closes part of that gap for quantised networks~\cite{stein2026nn2logic}.
+The baseline pipeline---packaging, bounded tree exploration, mixed-integer leaf certification, \ac{IIS} compression, hybrid C emission, and the two-phase runtime of logic flow followed by neural fallback---is described in Section~\ref{sec:bg-nn2logic} with Stein \textit{et al.}'s running example.
+Their published Ibex evaluation is limited to small fully connected classifiers, reports cycle counts but not generated code size, and lists convolutional models as explicit future work~\cite{stein2026nn2logic}.
+
+Adjacent interpretability work also uses tree representations of neural networks, but typically trains a separate tree model or analyses structure for explanation rather than for cycle-accurate hybrid codegen~\cite{aytekin2022nns}.
+No other published system known to the author combines the same ingredients---exact tree equivalence, solver-based leaf certification, subset selection of routes, and bare-metal hybrid emission---for TinyML-scale \acp{CNN} on a microcontroller-class \mbox{RISC-V} target.
+The present thesis therefore extends NN2Logic and asks which additional mechanisms are required when the dominant cost is convolutional rather than fully connected.
+
+
+\section{Analysis of Related Work}
+\label{sec:rw-analysis}
+
+Table~\ref{tab:rw-comparison} summarises how the main lines of related work compare to the approach pursued here.
+The rows are not mutually exclusive in practice---a deployed system might combine quantisation with an optimised kernel library---but they differ in what aspect of inference they change.
+
+\begin{table}[htbp]
+	\centering
+	\small
+	\setlength{\tabcolsep}{6pt}
+	\renewcommand{\arraystretch}{1.2}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.23\textwidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+		\toprule
+		\textbf{Approach} & \textbf{What is optimised} & \textbf{What stays unchanged} \\
+		\midrule
+		Kernel libraries and embedded runtimes\newline
+		{\footnotesize\cite{lai2018cmsisnn,david2021tflite}}
+		& Per-operator latency and memory
+		& Static layer graph; every sample runs the same operators \\
+		Architecture co-design\newline
+		{\footnotesize\cite{lin2020mcunet}}
+		& Model size and schedule under an engine budget
+		& No input-dependent logic extracted from a fixed trained model \\
+		Compression and quantisation\newline
+		{\footnotesize\cite{han2015deepcompression,jacob2018quantization,sun2023classquant}}
+		& Weight count and arithmetic precision
+		& Neural execution model \\
+		Early-exit networks\newline
+		{\footnotesize\cite{teerapittayanon2016branchynet,wang2024earlyexit,guo2025dynamic}}
+		& Average depth of layer execution
+		& Learned exits; full front end typically runs before exit \\
+		Tree equivalence\newline
+		{\footnotesize\cite{aytekin2022nns}}
+		& Conceptual structure of the mapping
+		& No compilation or \ac{MCU} evaluation \\
+		NN2Logic (fully connected)\newline
+		{\footnotesize\cite{stein2026nn2logic}}
+		& Cycle count via certified logic flow
+		& Demonstrated on FC models only; no code-size analysis \\
+		\addlinespace
+		\textbf{This thesis}
+		& Logic-flow routes for tiny \acp{CNN}; cycles and code size jointly
+		& Builds on NN2Logic; still a hybrid with neural fallback \\
+		\bottomrule
+	\end{tabularx}
+	\caption{Comparison of related approaches with the present work.}
+	\label{tab:rw-comparison}
+\end{table}
+
+Three gaps follow from this comparison and motivate the extensions developed in later chapters.
+
+\textbf{Representation.}
+NN2Logic was demonstrated on networks already expressed as sequences of linear layers.
+TinyML vision models are convolutional; encoding them for tree construction while preserving integer equivalence is a non-trivial step that standard runtimes handle internally but do not expose as a certifiable tree.
+
+\textbf{Cost asymmetry.}
+In fully connected models such as the room-occupancy perceptron evaluated by Stein \textit{et al.}\ (Section~\ref{sec:bg-nn2logic}), layers have comparable cost, so a route that exits after a few early decisions can skip a substantial fraction of \acp{MAC}.
+In the tiny \acp{CNN} studied here, Table~\ref{tab:mac-breakdown} in Chapter~\ref{ch:background} shows that the first stage typically absorbs \(77\,\%\) to \(94\,\%\) of integer muladds while the head remains comparatively cheap.
+Route selection and code generation must therefore account for a cost profile that the original NN2Logic study did not need to address.
+
+\textbf{Deployability.}
+Microcontroller deployment is constrained by Flash as well as by cycles.
+An approach that improves average latency by embedding many unrolled convolutional paths can fail in practice if the binary no longer fits.
+Joint consideration of cycle count and generated code size is therefore part of the problem, not an optional post-processing step; the evaluation chapter reports both metrics.
+
+The evaluation chapter tests whether the mechanisms introduced for these three gaps yield a net benefit on several TinyML workloads; the analysis there replaces speculation with measured outcomes.
+
+
+\section{Summary}
+\label{sec:rw-summary}
+
+Microcontroller inference stacks and kernel libraries make static neural graphs fast on \acp{MCU} but do not change the graph's input-independent structure~\cite{lai2018cmsisnn,david2021tflite,lin2020mcunet}.
+Compression and quantisation reduce the cost of that structure but preserve it~\cite{han2015deepcompression,jacob2018quantization,sun2023classquant}.
+Early-exit networks skip depth adaptively, yet rely on learned thresholds and typically execute the full feature extractor before any exit can fire~\cite{teerapittayanon2016branchynet,wang2024earlyexit,guo2025dynamic}.
+Exact tree equivalence~\cite{aytekin2022nns} and the NN2Logic hybrid baseline (Section~\ref{sec:bg-nn2logic}) point toward logic-flow execution on a \ac{CPU}, but the published NN2Logic results leave convolutional models, code size, and the cost profile of Table~\ref{tab:mac-breakdown} unaddressed.
+
+The present thesis occupies the space left open by that prior work: extending logic-flow hybrid execution to tiny quantised \acp{CNN} while treating code size and convolution-dominated \ac{MAC} profiles as first-class constraints.
+The design chapter specifies how that extension is achieved; the evaluation chapter reports whether it pays off in practice.
+
+%*****************************************
+\chapter{Design}
+\label{ch:design}
+%*****************************************
+\hint{This chapter should describe the design of the own approach on a conceptional level without mentioning the implementation details.}
+
+Chapter~\ref{ch:relatedwork} identified three gaps between published NN2Logic results and TinyML-scale \acp{CNN}: faithful integer encoding of convolutional models, route selection under a convolution-dominated muladd profile, and joint control of cycle count and generated code size.
+This chapter states the conceptual design that addresses them---what the extended pipeline must do and how its parts fit together---without toolchain detail (Chapter~\ref{ch:implementation}) or measurements (Chapter~\ref{ch:evaluation}).
+
+
+\section{Requirements and Assumptions}
+\label{sec:design-requirements}
+
+\subsection{Functional requirements}
+
+The extended system accepts a fixed quantised \ac{CNN}---convolution, fused normalisation, pooling, and a small fully connected head---together with integer training samples and input-encoding metadata, and emits two bare-metal programs from the same weights: a layer-wise \textbf{reference} and a \textbf{hybrid} that tries a finite set of certified logic-flow routes before falling back to the reference body.
+Tree exploration and certification use the same linearised layer ordering as the reference; the hybrid may return early only on formally certified routes.
+Route selection chooses which paths to embed, rejects failures on a fidelity check, and caps dispatcher size.
+Code generation supports unrolled and looped first-stage convolution without changing the integer function; evaluation reports paired cycles and object-code size for fair comparison.
+
+\subsection{Scope and assumptions}
+
+The design targets the TinyML classifiers introduced in Section~\ref{sec:bg-cnn}: on the order of \(10^3\)--\(10^4\) integer muladds, piecewise-linear (\ac{ReLU}) activations, and fixed input resolution at export.
+Simulation uses the Ibex configuration described in Section~\ref{sec:bg-riscv}.
+
+Tree exploration remains bounded by training-sample coverage and memory, as in baseline NN2Logic~\cite{stein2026nn2logic}.
+Quantisation quality is assumed adequate before tree building; hybrid emission cannot repair accuracy lost in \ac{QAT}.
+The design does not assume that every workload admits constant leaves for every class or conv-only exits on every task; such absences are treated as structural properties to report, not as implementation bugs.
+
+
+\section{System Overview}
+\label{sec:design-overview}
+
+Figure~\ref{fig:design-pipeline} shows the end-to-end workflow.
+Upstream stages---floating-point training, \ac{QAT}, packaging of integer weights and training samples, and NN2Logic tree exploration with leaf certification (Section~\ref{sec:bg-nn2logic})---follow the published framework and are integrated here as prerequisites rather than claimed as original contributions.
+The thesis-specific design begins at CNN export (before tree build) and continues with route selection and convolution-aware hybrid emission.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.92\textwidth]{figures/pipeline.jpeg}
+	\caption{Extended pipeline from quantised \ac{CNN} training to paired reference and hybrid bare-metal binaries.
+		Tree mathematics is unchanged; export, route selection, and convolution emission are the thesis-specific stages.}
+	\label{fig:design-pipeline}
+\end{figure}
+
+Tree generation reads the linearised integer network exactly as exported; CNN-specific choices apply only after certification---which routes are embedded and how the first stage is emitted in C---so the fallback body always matches the reference.
+Both binaries share weights, neuron indices, and the same fallback convolution policy where comparison requires it.
+
+
+\section{CNN Export and Linearisation}
+\label{sec:design-encoding}
+
+NN2Logic has no native convolution operator.
+Each stage is unfolded to an equivalent dense matrix at fixed resolution, as in Section~\ref{sec:bg-cnn}.
+Export-time decisions determine whether the tree remains tractable and whether codegen can map predicate neurons back to input patches.
+
+\subsection{Layer fusion and activation ordering}
+
+Batch normalisation is fused into the preceding convolution or linear layer before export, leaving piecewise-linear blocks only.
+Average pooling becomes a fixed linear map and, when geometry allows, is folded into the same matrix as the preceding convolution.
+A single \emph{feature-extractor} layer then replaces a long sequence of per-cell ReLU nodes.
+
+For the vision models in this thesis, ReLU is applied after the fused convolution--pool block rather than on every unfolded spatial row.
+That ordering shrinks the explored tree while preserving the quantised forward pass used for training and test.
+Naive unfolding would attach a separate ReLU decision to every spatial row of the first stage; the fused export collapses normalisation, pooling, and activation into one feature-extractor layer and records spatial geometry separately for later codegen.
+
+\subsection{Geometry and correctness}
+
+Unfolding removes explicit coordinates from the layer list, yet hybrid codegen must know which input pixels each predicate neuron depends on.
+The design stores a compact geometry description alongside the tree and uses it only after certification to restrict first-stage arithmetic.
+Export is correct when the linearised network reproduces the quantised \ac{CNN} on all encoded inputs; downstream steps must not alter weights or scales.
+
+
+\section{Route Selection}
+\label{sec:design-routes}
+
+The baseline NN2Logic emitter can embed any certified leaf, but on TinyML \acp{CNN} the linear head is cheap and the first linearised stage dominates cost (Table~\ref{tab:mac-breakdown}).
+Embedding every certified path therefore risks paying dispatcher overhead on most inputs while saving little arithmetic when a route fires late or saves only the final layers.
+Route selection is a separate design stage between leaf certification and hybrid emission: it reduces the certified set to a bounded embed list that is worth carrying in Flash.
+
+Each candidate route is judged by the work it avoids when it fires, not by how often it appears on training data alone.
+The selector ranks routes by expected net savings---muladds skipped minus the cost of evaluating the route's \ac{IIS} and minus the share of inputs that miss every embedded path and still run the fallback.
+Where the explored tree offers them, routes that exit from the first linearised stage---before the fully connected head---are preferred, because they can skip the head entirely on a match; when no such leaves exist, shallower exits are kept and the limitation is recorded rather than hidden.
+Each retained route is represented by a compressed \ac{IIS} prefix sufficient for certification; at runtime a route matches only when every sign test in that prefix agrees with the executed predicates.
+
+Before emission, shortlisted routes are checked against held-out training inputs and removed if they would return a different class than the full integer network.
+The number of routes embedded in the hybrid dispatcher is capped explicitly, because each additional path grows both predicate work and generated code size.
+Algorithmic details and parameter settings appear in Chapter~\ref{ch:implementation}; the evaluation chapter reports how the chosen caps behave on each workload.
+
+
+\section{Hybrid Code Generation}
+\label{sec:design-codegen}
+
+Once routes are fixed, codegen must resolve a tension that does not arise in fully connected NN2Logic models: evaluating every spatial position of the first stage on every sample is simple but inflates code size; skipping work on early exits requires knowing which feature-map positions each embedded route depends on.
+
+Figure~\ref{fig:design-hot-cold} sketches the resulting split.
+The first linearised stage is partitioned into \emph{hot} outputs---those referenced by embedded route predicates---and \emph{cold} outputs---the remainder of the feature map, needed only when no route fires.
+On the hybrid path, only hot positions are evaluated before the route dispatcher; if none match, cold completion finishes the stage and execution continues in the shared reference body.
+The reference program uses the same first-stage emission policy as that fallback so that measured cycle and Flash differences trace to logic-flow control rather than to a different convolution implementation.
+How unrolled and looped emission, partial evaluation, and operating points are realised is left to Chapter~\ref{ch:implementation}; the evaluation chapter reports paired metrics for each workload.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.92\textwidth]{figures/hot_cold_design}
+	\caption{Conceptual split of the first linearised stage on the hybrid path (hot predicate positions, then optional cold completion) versus the matched reference forward pass.}
+	\label{fig:design-hot-cold}
+\end{figure}
+
+
+\section{Scope and Structural Limits}
+\label{sec:design-limits}
+
+Evaluation covers four classifiers---MNIST even/odd, binary Fashion-MNIST, PneumoniaMNIST, and three-class HAR---whose datasets, topologies, and roles are defined in Section~\ref{sec:eval-workloads}; here we note only that hybrid gain need not be large on every task.
+On binarised MNIST even/odd, single-class constant leaves cap early exits at roughly half of inputs; on small multiclass heads such as HAR, conv-only exits may be absent and savings concentrate in the final layers.
+Loop-versus-unroll emission further trades cycles against Flash; the design documents both metrics rather than optimising one scalar objective.
+
+
+\section{Summary}
+\label{sec:design-summary}
+
+The design extends NN2Logic through CNN export with geometry, bounded route selection under fidelity constraints, and hot/cold first-stage emission with a matched reference fallback, without changing tree exploration or certification.
+Chapter~\ref{ch:implementation} realises these stages in the toolchain; Chapter~\ref{ch:evaluation} measures them against RQ1--RQ3.
+
+%*****************************************
+\chapter{Implementation}
+\label{ch:implementation}
+%*****************************************
+
+\hint{This chapter should describe the details of the implementation addressing the following questions: \medskip \\
+1. What are the design decisions made? \\
+2. What is the environment the approach is developed in? \\
+3. How are components mapped to classes of the source code? \\
+4. How do the components interact with each other? \\
+5. What are limitations of the implementation? }
+
+This chapter describes how the design of Chapter~\ref{ch:design} was realised.
+It follows the order in which artefacts are produced---environment, export, tree construction, route selection, code generation, verification---and states the decisions that were taken at each stage, including the ones that were measured and then discarded.
+Quantities are given where they justify a decision; the complete comparison across workloads is the subject of Chapter~\ref{ch:evaluation}.
+
+
+\section{Development Environment and Code Base}
+\label{sec:impl-environment}
+
+\subsection{Environment}
+
+Training, tree construction, and route selection run on a shared Linux \ac{GPU} server; simulation and code-size measurement run on the same machine but use no accelerator.
+Quantised training is implemented in Python with PyTorch, leaf certification uses Gurobi through the framework's C++ solver interface, and the conversion framework itself is a \texttt{pybind11} extension module built with CMake.
+Generated C is cross-compiled with a \mbox{RISC-V} GCC toolchain and executed in the Spike instruction-set simulator configured for the Ibex core (Section~\ref{sec:bg-riscv}).
+
+A single environment script centralises the settings that all stages need: Gurobi home and licence file, library and Python search paths for the extension module, and the location of the \mbox{RISC-V} binaries, exported as \texttt{NN2LOGIC\_RISCV\_BIN}.
+Long-running stages are started inside a terminal multiplexer, and tree construction is launched through a memory-capped wrapper, because it is the only stage whose failure mode is exhausting system memory rather than returning a wrong answer.
+
+\subsection{Conversion framework}
+
+All workloads in Chapter~\ref{ch:evaluation} pass through the same extended NN2Logic toolchain: the published tree builder and Gurobi certification are used unchanged, and the thesis contributions sit in the stages that follow---integer export of convolutional models, route selection, and hybrid C emission (Section~\ref{sec:impl-codegen}).
+The implementation is organised as one shared conversion library plus per-dataset export drivers (training, quantisation, tree construction, pick, and Spike evaluation).
+Figure~\ref{fig:impl-codebase} sketches the data flow from a trained checkpoint to the paired reference and hybrid binaries.
+
+\begin{figure}[H]
+	\centering
+	\fbox{\parbox{0.92\textwidth}{\centering\vspace{2.4cm}\textit{Pipeline layout (to be added)}\vspace{2.4cm}}}
+	\caption{End-to-end pipeline: per-workload export, shared NN2Logic extension, and generated reference/hybrid programs.}
+	\label{fig:impl-codebase}
+\end{figure}
+
+\subsection{Pipeline stages}
+
+Each workload is processed through the same ordered stages: floating-point training and \ac{QAT}; export to integer \texttt{QLayer}s; decision-tree construction on a bounded training sample set; route selection with empirical vetting; hybrid and reference C generation; cross-compilation for Ibex; and cycle-level simulation.
+Hyperparameters and sample limits differ by task but the stage graph is identical, which keeps comparisons across workloads meaningful.
+Reported measurements always pair a hybrid binary with a reference binary generated from the same quantised network and compiled with the same toolchain.
+
+
+\section{Export, Linearisation and Convolution Geometry}
+\label{sec:impl-export}
+
+\subsection{From the trained model to an integer layer list}
+
+Each workload provides an export script that trains the floating-point model, performs \ac{QAT}, fuses batch normalisation into the preceding convolution or linear layer, expresses average pooling as a fixed linear map, unfolds each convolutional stage into an equivalent dense matrix, and writes the integer weights, the per-layer requantisation metadata, and a set of encoded training samples.
+The scripts reuse the same export logic as the original occupancy pipeline; only dataset paths and hyperparameters differ.
+
+\subsection{Convolution metadata for code generation}
+
+Tree construction needs only the unfolded integer layers (\texttt{QLayer}s): each convolution is exported as a dense matrix, and Gurobi branches on \ac{ReLU} signs in that list, exactly as in the original occupancy workflow.
+The tree JSON therefore does not record kernel size, stride, or padding.
+
+Hybrid C generation is different.
+After \texttt{conv2d\_to\_linear}, the emitter sees a weight matrix but not that its rows come from sliding the same kernel over the input.
+To emit a convolution \emph{loop} or to evaluate only the receptive fields required by embedded routes (partial convolution), it needs a separate small JSON file with kernel size, stride, padding, and input/output shapes.
+The export scripts write this file next to the model artefacts; code generation reads it through \texttt{NN2LOGIC\_CONV\_GEOMETRY}.
+The tree file is not modified and tree construction does not use this file.
+
+This metadata matters only for the CNN workloads in Chapter~\ref{ch:evaluation}.
+Fully connected occupancy ignores it.
+If the variable is unset, generation still succeeds but falls back to fully unrolled dense code, which is much larger in Flash and is not the configuration reported here; the build scripts therefore check that the expected loop or sparse-table constructs appear in the generated C before accepting a measurement.
+
+
+\section{Baseline Tree Construction}
+\label{sec:impl-tree}
+
+Tree construction and leaf certification are used as provided by the framework and are not a contribution of this thesis; they are described here only to the extent that integration constrained the rest of the pipeline.
+The builder walks the exported layer list in fixed order, creates a decision node per \ac{ReLU}, and keeps only branches traversed by at least one encoded training sample.
+Certification formulates one mixed-integer feasibility problem per leaf and rival class and, where the class is provably constant, returns the \ac{IIS} of the infeasible system, that is, the minimal set of sign decisions that already proves the class.
+
+Three integration properties shaped later stages.
+First, exploration is bounded by the number of samples and by a memory cap; the tree, not the hybrid, is the memory-critical artefact (the largest tree surveyed here has $44{,}513$ leaves and ${\approx}270$\,MB of JSON).
+Second, because construction takes hours, trees are treated as fixed inputs and reused across experiments.
+Third, the certification output is richer than a class label per leaf; whether to build routes from certificates or from explored paths is settled by measurement in Section~\ref{sec:impl-routes}.
+
+\subsection{What makes a quantised model suitable for tree conversion}
+\label{sec:impl-tree-survey}
+
+A tree is worth deploying only if many of its leaves are \emph{constant} and if those leaves cover the classes one wants to accelerate.
+Neither property follows from test accuracy: among the trees surveyed below, models that agree to within a percentage point on the test set differ by an order of magnitude in constant leaves.
+What decides the outcome is the shape of the exported integer graph, and the rest of this subsection explains why, in three steps---first the mechanism, then the three design choices that follow from it, then the one limitation that no design choice removes.
+Thirteen trees built during the project were analysed with the framework's \texttt{QTreeAnalyze} routine to check the argument; Table~\ref{tab:impl-tree-survey} reports the outcome.
+
+\paragraph{Mechanism.}
+Every \ac{ReLU} that survives into the export becomes one binary decision in the tree, so \(n\) such units partition the input space into at most \(2^n\) affine regions, one per leaf.
+A leaf is constant when a single class wins throughout its region---for \emph{every} admissible input, not merely for the training samples that happened to reach it.
+The whole of the following discussion is a corollary of this: few ReLU units give few but large regions, and a large region dominated by one class is precisely what certification can prove, whereas each extra unit subdivides the space further until class boundaries cut through regions and leave them ambiguous.
+Exploring with more samples does not help, because samples only reveal the partition; the weights define it.
+
+\paragraph{Design choice 1: activation placement and fusion.}
+The quantity to minimise is not the number of layers but the number of ReLU units the export presents to the builder.
+Batch normalisation, pooling, and scaling are affine at inference time, so folding them into the neighbouring convolution or linear weights leaves the tree walking a plain chain of integer matrices separated by ReLU gates.
+The decisive benefit is that fusion lets the activation be \emph{moved}: with ReLU placed after pooling instead of before it, convolution and pooling become jointly linear and collapse into one matrix, cutting the branch dimensions from one per convolution output to one per pooled output---on the \(14{\times}14\) image models, from 196 units to 49.
+This is the largest single effect in the survey.
+Three binary Fashion-MNIST variants that share the dataset, the exploration budget, and essentially the same quantised accuracy split into two groups: the exports that keep the activation before pooling produce roughly twice as many leaves, of which only a small minority are constant, while the fused export halves the leaf count and certifies the majority of them.
+The same reasoning explains an initially surprising result, namely that leaving normalisation and dropout in the export as separate quantised stages is \emph{worse} than omitting them altogether: they improve float training but add requantisation steps and activation boundaries that the certifier must then reason through.
+
+\paragraph{Design choice 2: size and granularity of the label set.}
+Certification does not ask which class is most likely in a region; it asks whether any admissible input there could make a \emph{rival} class win.
+A leaf in a \(K\)-class model must therefore survive \(K-1\) such challenges, and the challenge is hardest between categories whose scores stay close.
+Binary tasks consequently convert far better than fine-grained multiclass ones, and among multiclass tasks what matters is whether the fused front end already separates the labels or whether separation is postponed to a wide final layer.
+Adding apparel categories to the same fused Fashion front end drove the constant leaves towards zero, whereas merging visually similar categories into one coarse class recovered a substantial number of certificates---but only for the merged class.
+Multiclass deployment thus requires both a small export and a label grouping that the front end already distinguishes; otherwise construction succeeds and yields nothing embeddable.
+
+\paragraph{Design choice 3: input distribution.}
+Inputs that leave many units switched off across wide stretches of the input space, such as sparse images with a large uniform background or low-dimensional sensor readings, create regions where the output reduces to the bias term and stays there.
+Dense inputs without that structure, such as continuous inertial streams, hold activations near their switching points, so regions stay small and mixed.
+This places the surveyed workloads at either end of Table~\ref{tab:impl-tree-survey} without any appeal to how hard the classification task is.
+
+\paragraph{Remaining limitation: class coverage.}
+Even a favourable tree may certify only one class, a possibility the framework itself anticipates~\cite{stein2026nn2logic}.
+The reason follows from the mechanism above: the class assigned to the bias-dominated region, where most units are inactive, occupies a large and stable part of the partition and is easy to prove, while the opposite class needs specific features active with sufficient margin, which some input inside the same region can always undercut.
+Which class occupies that position depends on the learned weights rather than on the semantics of the task, and it indeed flips between variants of the same problem in Table~\ref{tab:impl-tree-survey}.
+Hybrid coverage is then bounded by how many inputs belong to the certified class, so a tree with a high constant-leaf percentage can still leave half the test set without an early exit.
+
+\paragraph{Consequence.}
+NN2Logic behaves as a compiler for small, fused, piecewise-linear classifiers, and the practical recipe is to minimise ReLU units in the export, fold every affine block into the weights, order the activations so that convolution and pooling collapse into a single stage, prefer binary or coarsely grouped labels, and expect coverage of part of the label space rather than all of it.
+These are properties of the conversion paradigm rather than of one implementation, and no amount of tuning in route selection or code generation can recover exits that certification never produced.
+The workloads reported in Chapter~\ref{ch:evaluation} were chosen to sit at different points along this spectrum; the pilots whose constant-leaf columns are empty or nearly so are kept in the table because they mark where the spectrum ends.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Leaf statistics from \texttt{QTreeAnalyze} on thirteen curated trees (training exploration set of each tree).
+		Architectures are summarised in Section~\ref{sec:eval-workloads}.
+		Constant leaves are Gurobi-certified single-class leaves; the class column lists counts per output label.}
+	\label{tab:impl-tree-survey}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.22\textwidth}rrr>{\raggedright\arraybackslash}p{0.24\textwidth}@{}}
+		\toprule
+		\textbf{Workload} & \textbf{Architecture (summary)} & \textbf{Samples} & \textbf{Leaves} & \textbf{Const.\ (\%)} & \textbf{Const.\ by class} \\
+		\midrule
+		Fashion binary BNF & $14^2$, conv+pool fused, lin.\ $49{\rightarrow}4{\rightarrow}2$ & 12000 & 5351 & 3846 (71.9) & T-shirt 3846, Trouser 0 \\
+		Fashion binary BNF (MCG) & same, alternate build & 12000 & 5384 & 3893 (72.3) & T-shirt 3893, Trouser 0 \\
+		Fashion binary legacy & $14^2$, \ac{ReLU} before pooling, unfused & 12000 & 11144 & 1709 (15.3) & T-shirt 0, Trouser 1709 \\
+		Fashion BN unfused & $14^2$, BN+dropout kept as separate stages & 12000 & 11379 & 737 (6.5) & T-shirt 737, Trouser 0 \\
+		MNIST even/odd BNF & $28^2$, fused conv front-end & 60000 & 44513 & 18834 (42.3) & even 18834, odd 0 \\
+		PneumoniaMNIST & $14^2$, same CNN as Fashion BNF & 4708 & 2366 & 1336 (56.5) & normal 0, pneumonia 1336 \\
+		HAR 3-class & $128{\times}9$, pooled fused CNN, lin.\ $\rightarrow 3$ & 7352 & 588 & 227 (38.6) & static 206, walk 0, stairs 21 \\
+		Occupancy CNN & sensor CNN, lin.\ head & 8000 & 268 & 90 (33.6) & vacant 82, occupied 8 \\
+		Fashion-4 & BNF front-end, four-way head & 12000 & 7189 & 36 (0.5) & T-shirt 36 only \\
+		Fashion-3 footwear & BNF front-end, three-class merge & 24000 & 13688 & 1940 (14.2) & shirt 57, trouser 0, shoe 1883 \\
+		Fashion-10 & BNF front-end, ten-way head & 12000 & 8894 & 0 (0.0) & none \\
+		Occupancy FC (convgen) & FC $22{\rightarrow}10{\rightarrow}25{\rightarrow}2$ & 8132 & 261 & 85 (32.6) & vacant 76, occupied 9 \\
+		Occupancy conv (convgen) & conv export, same task & 8132 & 261 & 85 (32.6) & vacant 76, occupied 9 \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+
+\section{Route Selection}
+\label{sec:impl-routes}
+
+Route selection is implemented as a Python stage between the tree file and the emitter.
+It reads the tree, builds a pool of candidate routes, scores them under an explicit cycle model, searches for a bounded subset, and writes an embed file listing the routes to be generated.
+The emitter consumes only that file, which is what allows the same route set to be emitted under different code-generation policies and the same policy to be applied to different route sets.
+
+Placing selection outside the emitter was itself a decision.
+The baseline framework selects routes inside the generator: it ranks candidates by skipped multiplications against agreement counts on the training samples, and then searches over orderings of the sign tests by compiling and simulating each candidate ordering.
+That loop is accurate but expensive, and it optimises a quantity---multiplications skipped in the flat layer list---that does not distinguish the convolutional front end from the head, which is exactly the distinction that matters here.
+Providing an embed file suppresses the internal search entirely, so the two concerns become separable: the selection stage can use a convolution-aware cost model and full-split vetting without touching the generator, and the generator can be re-run on a fixed route set in seconds.
+The internal selector is retained and still runs when no embed file is supplied, which is what makes the baseline behaviour reproducible for comparison.
+
+\subsection{Candidate pool and empirical vetting}
+
+A candidate route is a sequence of sign tests on specific neurons plus the class to return.
+Candidates can be derived from the trimmed explored path, from the certificate of the leaf, or from both, selected by a mode flag.
+Path-derived candidates are additionally reduced by dropping tests that are not needed to separate the leaf from the samples that reach it, and by hardening the remaining bits against samples that agree on the prefix but disagree on the class.
+
+Filters then remove candidates that cannot be justified statistically: a minimum number of decisions, a risk bound of the form \(1/(g+2)\) on the number \(g\) of supporting samples, agreement on a stratified hold-out split, and optionally agreement on several independent hold-out splits.
+A conv-only filter restricts the pool to routes whose decisions live in the first linearised stage, which is the case that can skip the head entirely.
+Evaluating bits over many samples dominates the runtime, so the per-neuron activations are precomputed once per tree and cached on disk; the cache is reused by every subsequent pick on that tree.
+
+The size of the vetting set turned out to matter more than any other pick parameter.
+On the chest-radiograph workload, vetting on 1500 samples and vetting on the full training split produce the same cycle ratio but not the same fidelity: the accuracy penalty falls from \(-1.29\) percentage points to \(-0.48\).
+Routes admitted under weak vetting fire on inputs where the fallback would have disagreed, which improves apparent coverage at the cost of accuracy.
+Full-split vetting is therefore mandatory for any configuration that is reported, and the disk cache makes its cost a one-off per tree.
+
+\subsection{Cost model and bounded search}
+
+Scoring uses an explicit expected-cycle model rather than coverage.
+For a candidate set, the model charges each covered sample the cost of the route's own checks, each uncovered sample the full network, and every sample a per-route dispatcher term plus a shared-trunk term.
+The resulting quantity is the expected muladd count per sample, which is used both as the reported objective and, optionally extended with a fidelity penalty proportional to the estimated error rate, as the ranking key inside the search.
+
+The search itself is a beam search over route sets with a width parameter, a per-class budget, a compatibility check between routes, and a leave-one-out pruning pass at the end.
+Bounds are explicit: a maximum number of embedded routes, a maximum admissible error rate, and the risk bound above.
+The presets used for the reported configurations are listed in Table~\ref{tab:impl-pick}; the number of routes in the last column is what the search actually retained, not the budget.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Route-selection presets for the reported configurations.
+		The budget was twelve routes in all four cases; the last column is the size of the selected set.}
+	\label{tab:impl-pick}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.28\textwidth}XXr@{}}
+		\toprule
+		\textbf{Workload} & \textbf{Vetting set} & \textbf{Pool scan} & \textbf{Routes} \\
+		\midrule
+		Fashion-MNIST (binary) & 3000 samples & 2000 leaves & 11 \\
+		PneumoniaMNIST & full training split & 2000 leaves & 12 \\
+		MNIST even/odd & 2000 samples & 1200 leaves & 6 \\
+		HAR (3-class) & full training split & conv-only pool & 1 \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+\subsection{Certified routes: why the IIS path was abandoned}
+\label{sec:impl-iis}
+
+Building routes from the certificates instead of from the explored paths is the theoretically attractive option, because an \ac{IIS} proves the class for every input consistent with it, not only for the observed samples.
+The option is implemented and was measured on two workloads; it does not produce useful early exits on convolutional models, and the reason is structural rather than a deficiency of the search.
+
+On the chest-radiograph tree, of 2706 leaves, 1135 carry no certificate at all and are therefore not candidates.
+The remaining 1571 carry exactly one subsystem each, every subsystem has four constraints, and after deduplication by constraint set they collapse into six distinct sets: the same four neurons certify hundreds of leaves.
+Given a budget of twenty-four routes the search embeds one, and correctly so: that route covers about 43\,\% of the samples but fires when only eight of 878 muladds remain, because a logical certificate has to be anchored in the first dense layer, and every dense neuron reads the whole convolution output.
+The best achievable ratio under a perfect oracle is therefore \(870/878 \approx 0.990\), and the measured binary is slower than the reference (ratio 1.034) because the simulator also charges the bit tests and branches.
+The emitter reports no hot neurons at all for that configuration, which is the same statement from the generator's side: there is nothing to evaluate partially, since all decisions live in a layer that the reference computes anyway.
+Nor is the outcome a lack of alternatives: with both origins enabled the pool holds 1398 candidates, and the search still selects the same certified route.
+
+The experiment was repeated on binarised MNIST with the search deliberately relaxed---fidelity penalty, error-rate bound, risk bound, hold-out requirement and per-route overhead all disabled---to rule out an overly strict search.
+The search then embeds four routes instead of one, all of them exiting in the dense layer with 2305 of 2313 muladds already spent, giving an oracle ceiling of \(0.9965\) and a measured cycle ratio of exactly 1.000 with unchanged accuracy and 112 bytes of extra code.
+Relaxing the search admits more certified routes; it does not create early exits inside the convolution.
+The implementation retains the certificate-based mode, including a variant selector for trees that offer alternative subsystems per rival class, since both measured trees offered none.
+
+\subsection{Box certification as a middle ground}
+
+Between a logical certificate valid over the whole input polytope and empirical vetting valid over the observed samples there is an intermediate guarantee, and it was implemented as a separate analysis tool so that it could be applied to an already generated route set without perturbing the pipeline.
+For each embedded route, the tool selects the training samples matching its bits, measures the per-coordinate box of the activations at the layer where the route exits, propagates intervals through the remaining layers, and certifies the route when the lower bound of its class logit dominates the upper bound of every rival.
+A route certified this way cannot fail for any input whose activations fall inside that box, which is a continuum rather than a sample set.
+The tool validates itself before reporting: its vectorised forward pass is compared against the integer forward pass that mirrors the generated reference C, and it aborts if an accumulator would leave the 32-bit range.
+
+On the twelve-route set of the chest-radiograph workload, one route certifies, and it is the route that exits in the dense layer---precisely where an early exit no longer saves the convolution.
+The eleven convolution routes fail for two independent reasons, both quantified.
+First, sampling inside each box yields between 427 and 1771 genuine counterexamples, so no tighter bound could certify them: the statement is false, not merely unproven.
+Second, the fraction of matching test samples falling outside the box built from training data reaches 62.5\,\% for one route, so even a certified conv route would cover only part of the real cases.
+As a cross-check, the tool counts five disagreements with the reference over 515 matching test samples, which is consistent with the accuracy penalty measured in simulation.
+
+Table~\ref{tab:impl-criteria} summarises the three selection criteria that were implemented.
+The two with formal guarantees fail for the same reason: in a convolutional model the class is decided in the dense layer, and a certificate that does not reach it is either impossible or false.
+Empirical vetting is not a shortcut chosen for convenience; it is the only one of the three that produces early exits inside the convolutional part, and its cost in fidelity is measured rather than assumed.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Route-selection criteria implemented, and where each one anchors its decisions.}
+	\label{tab:impl-criteria}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth}>{\raggedright\arraybackslash}p{0.24\textwidth}X@{}}
+		\toprule
+		\textbf{Criterion} & \textbf{Guarantee} & \textbf{Outcome on tiny \acp{CNN}} \\
+		\midrule
+		\ac{IIS} certificate & Whole input polytope & Anchors in the dense layer; oracle ceiling \(0.990\) and \(0.997\); measured ratios \(1.034\) and \(1.000\). \\
+		Empirical box with interval propagation & Continuum inside the observed box & One of twelve routes certifies, and it is the one that saves nothing. \\
+		Empirical vetting & Observed distribution & Exits inside the convolution; fidelity cost measured per workload. \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+\subsection{Code size inside the selection objective}
+
+Because generated code size is a first-class metric, the selection objective was extended with an optional term penalising the union of the receptive-field closures of the selected routes.
+The union, not the sum, is the right quantity: neurons shared by several routes are emitted once, so sharing is free in code size.
+The term is maintained incrementally inside the beam, and a sweep over its weight reuses the same pool, so an entire curve costs roughly one pick.
+
+On the chest-radiograph workload the mechanism behaves in a binary fashion, and the reason is instructive.
+One selected route exits in the dense layer and its closure covers essentially the whole convolution; the closures of the eleven convolution routes are subsets of it.
+While that route is in the set, the others add no hot arithmetic at all, so the penalty takes only two values and the search jumps from twelve routes to two as the weight increases, with no intermediate trade-off.
+The term is kept because it applies where cost is genuinely distributed across routes, a property that can be checked cheaply with the per-route marginal-cost report described in Section~\ref{sec:impl-measure}.
+
+
+\section{Hybrid Code Generation}
+\label{sec:impl-codegen}
+
+The emitter turns a tree, an embed file, and a geometry description into two C translation units: the hybrid program and the reference program.
+Behaviour is controlled by environment variables read at generation time, which is what makes a configuration reproducible: every reported measurement is the pair of an embed file and an environment block.
+
+\subsection{Dispatcher and match semantics}
+
+The dispatcher evaluates the neurons needed by the embedded routes, forms the corresponding bits, and returns the certified class when a route matches; otherwise it falls through to the reference body.
+Routes may share a common prefix of tests, and the emitter can order decisions before activations so that a match is detected as early as possible.
+Partial convolution is the option that restricts first-stage arithmetic to the receptive fields required by the embedded routes, using the convolution metadata file; enabling it implies the decision-first ordering.
+
+One defect in this area is worth documenting because it produced plausible but wrong numbers.
+The match mode defaults to prefix matching with a prefix length of one, so a route fires as soon as its \emph{first} bit agrees.
+Invoking the generator directly, rather than through the workload wrapper that sets exact matching, produced roughly twice the expected number of early exits on a three-class model and an accuracy of about 86\,\% instead of the reference's 99.5\,\%.
+The rule adopted afterwards is that exact matching is set explicitly by every wrapper, and that the generated file is checked for it before measurement.
+
+A second default of the upstream emitter was disabled for all reported measurements.
+That option gates activations on non-zero inputs, which on binarised images skips a large part of the arithmetic in the hybrid while the dense reference still performs it.
+It yields an attractive-looking cycle ratio of 0.815 with 96.5\,\% of samples nominally faster, but the comparison is not between hybrid control flow and a reference: it is between a sparsity optimisation and its absence.
+It is therefore switched off, and the corresponding historical run is kept only as a documented artefact.
+
+\subsection{Looped convolution and the cold path}
+
+Looped emission is implemented in a dedicated translation unit of the thesis fork.
+It emits the kernel once as a static array, builds a zero-padded copy of the input so that every visited position is interior, and generates the loop nest for the first stage.
+Two styles exist---a tight nest and a rectangular one---and the loop can visit either all output positions or only a given subset.
+
+The subset form is what the hybrid needs, and the reason is a measured inefficiency of the first working version.
+A rectangular nest over all 49 output positions recomputed the positions that the hot path had already evaluated before the early-exit test, and that arithmetic was paid by every sample that did not exit---about 63\,\% of the test set on the clothing workload.
+Emitting explicit coordinate tables and visiting only the cold positions leaves the early-exit rate and the minimum cycle count untouched while reducing the median and maximum of the fallback path, improving the mean cycle ratio against the looped reference from 0.857 to 0.709 at a cost of roughly a hundred bytes of tables.
+
+Two correctness details were established by measurement rather than by inspection.
+The padded frame must be complete: an early version that trimmed rows to the region actually visited produced about 700 argmax disagreements on the clothing workload, against the eight that the unrolled hybrid with the same route set produces.
+Conversely, the output buffer of the cold path is deliberately \emph{not} zero-initialised, which saves on the order of 140 cycles per sample, because the positions that are never written are also never read.
+
+Accumulator width is a separate switch.
+All reported configurations use 32-bit accumulators, with the emitter selecting the narrowest safe type per layer from the weight magnitudes and the bound on input magnitude.
+Earlier measurements with 64-bit accumulators are not comparable and are excluded, because moving from 64 to 32 bits changes cycle counts by more than the effect under study.
+
+\subsection{Hot path emission}
+
+By default the neurons referenced by route predicates are emitted as unrolled multiply--accumulate chains with the weights as immediate operands, restricted to their receptive fields when partial convolution is enabled.
+Measuring code size across route subsets of the same tree gives a linear relation between the generated size and the number of hot convolution muladds, with an intercept of roughly the reference size and a slope of about fifteen bytes per muladd, fitting six configurations with a maximum residual of 55 bytes.
+The intercept is the informative part: essentially all of the hybrid's additional code size is hot first-stage arithmetic, and the per-route bookkeeping is lost in the noise.
+Fifteen bytes is what a multiply--accumulate with an immediate weight costs on a 32-bit \mbox{RISC-V} core once the constant has to be materialised.
+Figure~\ref{fig:impl-flash-model} shows the relation.
+
+\begin{figure}[H]
+	\centering
+	\fbox{\parbox{0.92\textwidth}{\centering\vspace{2.4cm}\textit{Generated code size versus hot first-stage muladds (to be added)}\vspace{2.4cm}}}
+	\caption{Measured object-code size of the hybrid against the number of hot first-stage muladds, for route subsets of one tree.
+		The intercept coincides with the size of the looped reference.}
+	\label{fig:impl-flash-model}
+\end{figure}
+
+That relation leaves two ways to reduce size: emit fewer hot muladds, which is route selection, or emit each of them once.
+The second was first attempted by sharing the \emph{weights}---reading the kernel from a table while still emitting one arithmetic block per neuron---and that made things worse on both axes, because an indexed load from read-only memory occupies more than the immediate it replaces.
+The version that works shares the \emph{body}: for each channel, one loop runs over a table of window base offsets and a table of biases, so the arithmetic appears once regardless of how many positions are hot.
+The accumulator is left unrequantised inside that loop, because the tree bits test the pre-activation value; this is precisely why the cold loop, which requantises internally, could not be reused for the hot path.
+Figure~\ref{fig:impl-generated-c} sketches the structure of the generated hybrid.
+
+\begin{figure}[H]
+	\centering
+	\fbox{\parbox{0.92\textwidth}{\centering\vspace{2.4cm}\textit{Structure of the generated hybrid program (to be added)}\vspace{2.4cm}}}
+	\caption{Structure of the generated hybrid translation unit: hot first-stage block, route bits and exits, cold completion loop, and the shared reference body.}
+	\label{fig:impl-generated-c}
+\end{figure}
+
+The mechanism is exposed through the switches in Table~\ref{tab:impl-hotloop}.
+Its cost follows the early-exit rate rather than the size of the network, which is the practically relevant finding: looping the hot path does not reduce work, it reduces copies of code, so the cycles it costs are paid only by the samples that were exiting cheaply.
+Where the early-exit rate is around 12--17\,\% the exchange is about 0.04--0.06 cycles per byte saved; where it reaches 37\,\% it rises to roughly 0.46, because a third of the test set stops exiting in about 140 cycles.
+The price is visible in the minimum cycle count, which rises once no route can fire before the loop completes, and that number must be quoted whenever favourable latency for easy samples is claimed.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Switches controlling hot first-stage emission, abbreviated from the \texttt{NN2LOGIC\_HYBRID\_} prefix.
+		All are off by default, so previously measured configurations are unaffected.}
+	\label{tab:impl-hotloop}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.34\textwidth}X@{}}
+		\toprule
+		\textbf{Switch} & \textbf{Effect} \\
+		\midrule
+		\texttt{HOT\_LOOP} & Enable shared-body emission for hot first-stage neurons; requires looped convolution and geometry. \\
+		\texttt{HOT\_LOOP\_FROM} & Cut index in the exit order: the first \(k\) routes stay unrolled and staggered, the rest move into the shared loop. \\
+		\texttt{HOT\_LOOP\_MIN} & Channels with fewer hot positions than this stay unrolled. \\
+		\texttt{HOT\_LOOP\_DEFER\_BITS} & Postpone bits of routes checked after the loop. \\
+		\texttt{HOT\_LOOP\_FREE\_EXITS} & Move routes that contribute no loop position ahead of the loop. \\
+		\texttt{HOT\_LOOP\_PAD} & Let the hot loop read the zero-padded buffer, so border positions also enter the loop. \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+Four ablations were run on independent hypotheses about the remaining code size, and all four were negative (Table~\ref{tab:impl-ablations}).
+The one that deserves a sentence of its own is border handling.
+Because the shared loop body is a single block, it cannot trim the window per position, so positions whose kernel would leave the image stay unrolled, and they are what keeps the hybrid's size above the reference.
+Letting the hot loop read the padded buffer does bring all positions into the loop and leaves accuracy unchanged, confirming that the buffer and indexing are correct, but it adds a fixed cost of roughly 2900 cycles per sample for building the frame before a single bit is tested.
+The resulting binary is slower than evaluating the whole network, which disqualifies it as an operating point: the option is implemented, measured, and left off.
+A related idea---grouping border positions by trimming class so that each class gets its own loop---was not implemented, because in the geometry at hand the border decisions spread over four or five classes with about two positions each, which is exactly where loop overhead cancels the saving.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Code-generation ablations, each isolating a different hypothesis, and their measured verdicts.}
+	\label{tab:impl-ablations}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth}>{\raggedright\arraybackslash}p{0.26\textwidth}X@{}}
+		\toprule
+		\textbf{Ablation} & \textbf{Hypothesis isolated} & \textbf{Verdict} \\
+		\midrule
+		Shared kernel weights & Sharing weights rather than the body & Code size increases and cycles rise; rejected. \\
+		Padded hot loop & Bringing border positions into the loop & Smaller but about 2900 fixed cycles per sample; hybrid slower than the reference. \\
+		Deferred tree bits & Tree variables living across the loop & Inert at the cut where the anomaly appears; no bits deferred. \\
+		Early free exits & Computation living across the loop & Mean and median both worsen; dominated. \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+The choice of cut index was also automated as an opt-in policy: the emitter reads a coverage figure from the embed file and selects a cut from two thresholds.
+It reproduces the hand-chosen configuration exactly on one workload and misses it on two others, because the coverage figure available in the embed file is leaf mass in the tree rather than first-match coverage of the trimmed route.
+The policy is therefore documented as an ablation and not used for reported configurations, which set the cut explicitly from the early-exit rate measured in simulation.
+
+\subsection{Matched reference emission}
+
+The reference generator writes the fully unrolled program and, when geometry is available, its looped sibling in the same invocation.
+All comparisons that are reported pair a looped hybrid with the looped reference and the same accumulator width, so that the difference is hybrid control flow and not convolution style.
+The unrolled pair is kept as an ablation, since it quantifies the loop's intrinsic cost independently of the tree: emitting the first stage as a loop costs about 60\,\% more cycles and saves about 70\,\% of the reference's code size on both image workloads.
+
+
+\section{Verification and Measurement}
+\label{sec:impl-measure}
+
+\subsection{Host-level equivalence}
+
+Compiling for \mbox{RISC-V} and running the simulator takes minutes, which is too slow a loop for iterating on a code generator.
+A host-side checker therefore compiles two generated C files with the host compiler, feeds them the same encoded dataset header, and compares outputs sample by sample in seconds.
+It has two modes, because not every pair should agree on the same thing: exact comparison of output values for the unrolled and looped references, which compute the same function so that any difference is a bug, and argmax comparison for hybrid against reference, where the hybrid writes a certified class instead of logits and only the decision must agree.
+This checker is what made the sparse cold path and the hot loop tractable to develop; the padded-frame defect described above was found with it, not in simulation.
+
+\subsection{Cycles and code size}
+
+Cycle counts come from the architectural cycle counter inside the simulator, accuracy from the pass/fail lines of the simulator log, and every reported figure uses the complete test set of the workload.
+A comparison driver runs a reference and a variant, pairs them per sample, and reports mean, median, minimum and maximum together with the fraction of samples on which the hybrid is faster.
+
+Code size is measured on the compiled model object rather than on the linked executable, because the executable embeds the test dataset, the startup code, and the simulator syscalls, which would dilute any difference between variants.
+Both the executable and read-only sections are summed, which is not optional: unrolled emission keeps weights in the instruction stream as immediates, while looped emission moves them into read-only data, so looking at one section alone would report a saving that does not exist.
+
+\subsection{Fast probes and bookkeeping}
+
+Three probe scripts sweep code size without running the pick or the simulator, taking about a minute per point: one over the number of routes of a given embed, one over a list of different embeds, and one over the hot-loop cut index.
+A subset tool trims routes from an already computed embed and reports the marginal cost of each route in bits, new hot neurons and coverage, which is what identified that four routes carry most of the coverage of the chest-radiograph set while contributing one new neuron each.
+A structural analyser splits a generated C file into hot and cold muladds, routes, bits and arrays, and a table builder joins simulator logs, code-size reports and embed metadata into a single table.
+
+One infrastructure failure is recorded because it invalidated measurements.
+During one session the compiled extension module on the server was stale and emitted the rectangular cold nest despite the sparse flag being set.
+The code-size figures from that session remained valid, since the nest changes only the coordinate tables, but the cycle figures were not comparable and were re-measured after an explicit rebuild.
+A rebuild script is now run at the start of any measurement campaign, and the reference configuration is re-measured as a control.
+
+
+\section{Final Configurations}
+\label{sec:impl-final}
+
+All four reported configurations share the same code-generation policy: looped first stage with the tight style on both sides, sparse visitation of cold positions, 32-bit accumulators, partial convolution driven by the convolution metadata, exact route matching, and the activation gate disabled.
+They differ only in the route set and in whether the hot path is emitted as a shared loop.
+Three workloads use the shared hot loop with the cut at zero, so that all hot neurons are computed before the first exit test; the activity-recognition workload does not, because its route set consists of a single route with two decision neurons and there is no repeated body to amortise.
+
+Table~\ref{tab:impl-final} identifies the four artefacts that Chapter~\ref{ch:evaluation} measures: which route set and which hot-path policy each one was generated with.
+Their cycle counts, code sizes and accuracies are reported and discussed there, together with the alternative operating points around each of them.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{The four generated configurations that Chapter~\ref{ch:evaluation} evaluates.
+		All share the code-generation policy described above and differ only in the columns shown.}
+	\label{tab:impl-final}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth}rr>{\raggedright\arraybackslash}X@{}}
+		\toprule
+		\textbf{Workload} & \textbf{Routes} & \textbf{Pred. neurons} & \textbf{Hot-path emission} \\
+		\midrule
+		Fashion-MNIST (binary) & 11 & 20 & Shared loop, cut at 0 \\
+		PneumoniaMNIST & 12 & 25 & Shared loop, cut at 0 \\
+		MNIST even/odd & 6 & 15 & Shared loop, cut at 0 \\
+		HAR (3-class) & 1 & 2 & Unrolled \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+Two implementation notes belong with that table.
+The uniform policy is a deliberate choice: applying one code-generation configuration to all workloads makes the comparison across tasks meaningful, at the price of not being the cheapest point for each one individually.
+On the clothing workload in particular, trimming the route set yields a smaller binary at a slightly higher cycle count, and that trade-off curve belongs to the evaluation rather than to the implementation.
+Second, the fidelity of these binaries is bounded by the quantised network whenever the fallback runs, so any accuracy difference against the reference comes from routes admitted by empirical vetting that disagree on a handful of test samples---the same disagreements that the route-level cross-check of Section~\ref{sec:impl-routes} counts directly.
+
+
+\section{Variants Explored Without Success}
+\label{sec:impl-negative}
+
+Several directions were implemented and measured before being set aside.
+They are listed here because they delimit what the approach can do, and because the negative results carry most of the explanatory weight of this thesis (Table~\ref{tab:impl-negative}).
+
+The model-level case deserves more than a table row.
+A three-class variant of the clothing task, obtained by merging the footwear classes, reaches 99.5\,\% accuracy with the hybrid exactly matching the reference, so the selection is sound; yet the mean saving is 0.52\,\%.
+The diagnosis is structural and was obtained from the pool report rather than from simulation: no leaf is decided by the convolution alone, because that stage has a single output channel, so every certified class needs a dense-layer predicate.
+All selected routes exit after the first dense layer, where only the final layer remains, which is 48 of 1304 muladds, about 3.7\,\% of the network.
+A sweep of the minimum-saving threshold from 5\,\% to 40\,\% returns zero expected exits at every setting, which says that no pick parameter can repair it.
+The available lever is architectural---widening the first stage so that classes separate in early features and conv-only leaves appear---and that requires retraining, rebuilding the tree, and re-running selection, which places it outside the scope of the reported results.
+Two further workloads, a ten-class clothing task and a convolutional occupancy model, remain wired into the harness but were not carried through to reported configurations for the same reason.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Directions implemented and measured, then set aside.}
+	\label{tab:impl-negative}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.28\textwidth}X@{}}
+		\toprule
+		\textbf{Direction} & \textbf{Why it was set aside} \\
+		\midrule
+		Routes from \ac{IIS} certificates & Certificates anchor in the dense layer; oracle ceilings of \(0.990\) and \(0.997\), measured ratios \(1.034\) and \(1.000\). \\
+		Box certification with interval propagation & One of twelve routes certifies, and it is the one that saves nothing; counterexamples exist inside the box. \\
+		Three-class merged-footwear model & No conv-only leaves with a single-channel first stage; exits save 3.7\,\% of the network. \\
+		Activation gating on non-zero inputs & Favourable ratio is an artefact of comparing against a dense reference. \\
+		Rectangular cold nest & Recomputes hot positions on every fallback sample. \\
+		Shared hot kernel weights & Indexed loads cost more code than the immediates they replace. \\
+		Padded hot loop & Fixed frame-building cost makes the hybrid slower than the full network. \\
+		Automatic hot-loop cut & Available coverage proxy is leaf mass, not first-match coverage. \\
+		Code-size term in the pick objective & Degenerates to two values when one route's closure subsumes the others. \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+
+\section{Limitations of the Implementation}
+\label{sec:impl-limits}
+
+Convolution metadata for code generation must be supplied explicitly; the pipeline does not infer kernel geometry automatically from an unfolded weight matrix alone.
+Border positions of the first stage remain unrolled, and the measured alternative is worse, so the hybrid's code size stays above the reference by an amount that the geometry of the border sets.
+The code-generation policy for a given workload is chosen from the early-exit rate measured in simulation, since the automatic policy's proxy proved unreliable.
+
+Route selection depends on an activation cache that is large and specific to one tree, and full-split vetting, which the results require, is the slowest part of the pipeline.
+Tree construction inherits the memory bound of the baseline framework, which is what limits the size of the models that can be handled at all.
+
+Finally, the measured models have a single convolutional output channel in the first stage, and no configuration with a wider or deeper front end was carried through the full pipeline; the analysis of Section~\ref{sec:impl-negative} suggests that this is where the approach would have to be tested next.
+Measurement inherits the limits stated in Section~\ref{sec:bg-riscv}: cycle counts are architectural and do not model flash wait states or cache behaviour of a specific part.
+
+
+\section{Summary}
+\label{sec:impl-summary}
+
+The implementation adds three layers to the baseline framework without changing tree construction or leaf certification: convolution metadata consumed at code-generation time, a route-selection stage with an explicit expected-cycle model and empirical vetting, and a convolution-aware emitter with looped cold completion, partial hot evaluation, and optional shared-body emission of the hot path.
+Verification is layered so that host-level equivalence checks catch emitter defects before simulation, and measurement reports cycles and code size from the same pair of artefacts.
+The decisions that shaped this pipeline were settled by measurement, including the ones that closed off the certified-route options, and the resulting configurations are the ones evaluated in Chapter~\ref{ch:evaluation}.
+
+%*****************************************
+\chapter{Evaluation}
+\label{ch:evaluation}
+%*****************************************
+\hint{This chapter should describe how the evaluation of the implemented mechanism was done. \medskip \\
+1. Which evaluation method is used and why? Simulations, prototype? \\
+2. What is the goal of the evaluation? Comparison? Proof of concept? \\
+3. Which metrics are used for characterizing the performance, costs, fairness, and efficiency of the system?\\
+4. What are the parameter settings used in the evaluation and why? If possible always justify why a certain threshold has been chose for a particular parameter. \\
+5. What is the outcome of the evaluation? }
+\section{Goal and Methodology}
+
+\subsection{Research Questions}
+\label{sec:research-questions}
+
+The evaluation is guided by the following research questions, stated here after the conceptual and implementation chapters so that the terminology is established.
+
+\begin{enumerate}
+	\item \textbf{RQ1 (Representation).}
+	\label{rq:representation}
+	How can a quantised \ac{CNN}, including convolution, pooling, and fused batch normalisation, be encoded for NN2Logic so that the decision tree remains a faithful integer counterpart of the trained network?
+
+	\item \textbf{RQ2 (CNN-aware hybrid execution).}
+	\label{rq:hybrid}
+	How must path selection and code generation be adapted so that logic-flow early exits reduce \mbox{RISC-V} cycle count rather than evaluating the full convolution on every sample and charging check overhead to the rest?
+
+	\item \textbf{RQ3 (Deployability and structural limits).}
+	\label{rq:limits}
+	What is the trade-off between cycle count and code size when convolution is unrolled versus emitted as loops, and under which task properties is hybrid execution structurally limited?
+\end{enumerate}
+
+\section{Evaluation Setup}
+
+\subsection{Workloads and network topologies}
+\label{sec:eval-workloads}
+
+The reader needs two distinctions before the headline numbers in Section~\ref{sec:eval-results}.
+First, a \textbf{workload} is a dataset together with a fixed quantised network: input resolution, layer graph, class count, and train/test split.
+Second, not every workload trained during the project is \textbf{reported} in the tables below; several multiclass and legacy variants were built to test whether the tree admits enough constant leaves to justify hybrid deployment, and were set aside when the answer was no (Table~\ref{tab:impl-tree-survey}).
+
+Table~\ref{tab:eval-workloads} lists every task that matters for interpreting the thesis.
+The four rows marked \emph{reported} are the configurations measured in Table~\ref{tab:eval-headline}.
+The \emph{reference} row reproduces the fully connected occupancy model from Stein \textit{et al.}~\cite{stein2026nn2logic}, which defines the best-case hybrid behaviour against which the \ac{CNN} results should be read.
+The \emph{pilot} rows are negative or marginal cases kept in the study to show \emph{when} the approach fails, not because they reached competitive Spike numbers.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Workloads used in this thesis: data, quantised topology after batch-norm fusion and pooling linearisation, and role in the evaluation.
+		``BNF'' denotes the fused profile with batch normalisation and dropout in training only (identity at inference).
+		Tree depth is counted in \texttt{QLayer}s after export, not in PyTorch modules.}
+	\label{tab:eval-workloads}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.17\textwidth}>{\raggedright\arraybackslash}p{0.14\textwidth}>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}p{0.28\textwidth}r>{\raggedright\arraybackslash}p{0.10\textwidth}@{}}
+		\toprule
+		\textbf{Name} & \textbf{Dataset} & \textbf{Classification task} & \textbf{Quantised topology (summary)} & \textbf{Classes} & \textbf{Role} \\
+		\midrule
+		Occupancy FC & Room occupancy & vacant vs.\ occupied & FC $22{\rightarrow}10{\rightarrow}25{\rightarrow}2$ & 2 & reference \\
+		Occupancy CNN & Room occupancy & vacant vs.\ occupied & tiny CNN on $15$ features, then two linear layers & 2 & pilot \\
+		Fashion binary (BNF) & Fashion-MNIST & T-shirt vs.\ Trouser & $14{\times}14$ input; conv $1{\rightarrow}1$ ($k{=}3$) + avg.\ pool $\rightarrow$ lin.\ $49{\rightarrow}4{\rightarrow}2$; 3 \texttt{QLayer}s & 2 & reported \\
+		PneumoniaMNIST & Chest X-ray & normal vs.\ pneumonia & same $14{\times}14$ CNN head as Fashion binary & 2 & reported \\
+		MNIST even/odd (BNF) & MNIST & digit parity & $28{\times}28$ input; fused conv front-end + small FC head & 2 & reported \\
+		HAR (3-class) & UCI HAR & static / walking / stairs & $128{\times}9$ inertial window; conv + pool + lin.\ $\rightarrow 3$ & 3 & reported \\
+		Fashion legacy & Fashion-MNIST & T-shirt vs.\ Trouser & $14{\times}14$; conv $k{=}5$, separate pool, no BNF & 2 & pilot \\
+		Fashion-4 & Fashion-MNIST & four apparel classes & BNF front-end, four-way head (sneaker vs.\ boot split) & 4 & pilot \\
+		Fashion-3 footwear & Fashion-MNIST & shirt / trouser / footwear & BNF front-end, footwear classes merged & 3 & pilot \\
+		Fashion-10 & Fashion-MNIST & all ten apparel classes & BNF front-end, ten-way head & 10 & pilot \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+\paragraph{How to read the names.}
+\textbf{BNF} (batch-norm fused) is the CNN profile that gave the best trees on Fashion and MNIST: batch normalisation is folded into conv/linear weights before quantisation, ReLU is placed after pooling so conv and pool export as one linear stage, and dropout is disabled at inference.
+\textbf{Legacy Fashion} is an earlier $14{\times}14$ binary model with a larger convolution kernel and no fusion; it reaches similar floating-point accuracy but far fewer constant leaves (Section~\ref{sec:impl-tree}).
+\textbf{Occupancy FC} is the Stein \textit{et al.}~\cite{stein2026nn2logic} demonstration network; it is fully connected rather than convolutional and remains the upper bound on hybrid gain in this work.
+The \textbf{multiclass Fashion pilots} extend the binary task to three, four, or ten classes to test whether constant leaves survive finer-grained decision boundaries; they largely do not (Table~\ref{tab:impl-tree-survey}).
+
+\subsection{Metrics and platform}
+
+All reported figures use the paired reference/hybrid setup of Section~\ref{sec:bg-riscv}: architectural cycle counts from Spike on simulated Ibex, accuracy on the workload's held-out test set, the fraction of test inputs whose hybrid run is faster than the reference on the same input, and object-code size as a Flash proxy.
+Tree statistics (\texttt{totalLeaves}, constant-leaf fraction, class coverage of constant leaves) are computed on the same training sample set that was used to build the tree, because certification and exploration are training-data bounded.
+Common training settings are int8 \ac{QAT} with Adam/W optimisers; tree sample limits range from $12{,}000$ to the full training split depending on workload memory pressure.
+Exact pick budgets and route counts for the four reported configurations appear in Table~\ref{tab:impl-final}.
+
+\section{Evaluation Results}
+\label{sec:eval-results}
+
+The four configurations identified in Table~\ref{tab:impl-final} are measured against their matched looped reference on the complete test set of each workload.
+Table~\ref{tab:eval-headline} reports mean cycles, object-code size, and accuracy of the hybrid binary.
+
+\begin{table}[H]
+	\centering
+	\small
+	\caption{Hybrid against matched looped reference on the complete test set: mean cycles, object-code size in bytes, and accuracy of the hybrid binary.}
+	\label{tab:eval-headline}
+	\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.22\textwidth}rrrrrX@{}}
+		\toprule
+		\textbf{Workload} & \textbf{Hyb.} & \textbf{Ref.} & \textbf{Ratio} & \textbf{Hyb. B} & \textbf{Ref. B} & \textbf{Acc.} \\
+		\midrule
+		Fashion-MNIST (binary) & 4019 & 5170 & 0.777 & 5717 & 2652 & 97.60\,\% \\
+		PneumoniaMNIST & 4834 & 5278 & 0.916 & 6132 & 2854 & 84.62\,\% \\
+		MNIST even/odd & 14356 & 15274 & 0.940 & 6414 & 3042 & 91.80\,\% \\
+		HAR (3-class) & 13253 & 14384 & 0.921 & 6448 & 3486 & 83.20\,\% \\
+		\bottomrule
+	\end{tabularx}
+\end{table}
+
+\section{Analysis of Results}
+
+
+%*****************************************
+\chapter{Conclusions}
+\label{ch:closure}
+%*****************************************
+
+\hint{This chapter should self-critically summarize the thesis and describe the main contributions of the thesis. Subsequently, it should describe possible future work in the context of the thesis. What are limitations of the developed solutions? Which things can be improved?}
+
+\section{Summary}
+
+\section{Contributions}
+
+\section{Future Work}
+
+\section{Final Remarks}
